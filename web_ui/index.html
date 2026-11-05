@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#f8f7f3">
+  <meta name="description" content="和特蕾莎聊生活，在轻松的对话中练习英语。">
+  <title>Teresa · 你的日常英语伙伴</title>
+  <link rel="icon" href="./assets/flower.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="./styles.css">
+  <script type="module" src="./app.js"></script>
+</head>
+<body>
+  <svg class="icon-library" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+    <symbol id="i-chat" viewBox="0 0 24 24"><path d="M20 11.5a8 8 0 0 1-8 8H5l-3 2v-10a9 9 0 0 1 18 0Z"/><path d="M7 10h8M7 14h5"/></symbol>
+    <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M12 19V5m-6 6 6-6 6 6"/></symbol>
+    <symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="3"/><path d="M15 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h3"/></symbol>
+    <symbol id="i-spark" viewBox="0 0 24 24"><path d="m12 3 2.5 6.5L21 12l-6.5 2.5L12 21l-2.5-6.5L3 12l6.5-2.5Z"/></symbol>
+    <symbol id="i-leaf" viewBox="0 0 24 24"><path d="M20 4C9 2 3 7 5 14s15 8 15-10Z"/><path d="M4 21 15 10"/></symbol>
+  </svg>
+
+  <button class="sidebar-scrim" id="sidebar-scrim" aria-label="关闭侧边栏" hidden></button>
+  <aside class="sidebar" id="sidebar" aria-label="对话导航">
+    <a class="brand" href="./" aria-label="Teresa 首页">
+      <img src="./assets/flower.svg" width="38" height="38" alt="">
+      <span><strong>teresa<span class="brand-dot">.</span></strong><small>ENGLISH, WITH A FRIEND</small></span>
+    </a>
+    <button class="new-chat" id="new-chat"><svg class="icon"><use href="#i-plus"/></svg> 开始新的对话 <kbd>＋</kbd></button>
+    <div class="history-heading">最近的对话 <span id="thread-count">01</span></div>
+    <nav id="thread-list" class="thread-list" aria-label="当前页面的聊天记录"></nav>
+    <div class="sidebar-note">
+      <svg class="icon"><use href="#i-leaf"/></svg>
+      <p>A little progress,<br><em>every single day.</em></p>
+      <span>不必完美，开口就很好。</span>
+    </div>
+    <div class="sidebar-bottom">
+      <div class="learner-avatar">你</div>
+      <div><strong>我的英语时光</strong><span>对话仅保留在当前页面</span></div>
+      <span class="small-spark">✳</span>
+    </div>
+  </aside>
+
+  <main class="workspace">
+    <header class="topbar">
+      <div class="topbar-title">
+        <button id="menu-toggle" class="icon-button mobile-menu" aria-label="打开侧边栏" aria-controls="sidebar" aria-expanded="false"><svg class="icon"><use href="#i-menu"/></svg></button>
+        <div class="header-avatar"><img src="./assets/teresa.png" alt=""></div>
+        <div><h1>特蕾莎 <span>Teresa</span></h1><p>你的日常英语伙伴</p></div>
+      </div>
+    </header>
+
+    <div class="conversation-scroll" id="conversation-scroll">
+      <section class="welcome" id="welcome" aria-label="开始和特蕾莎聊天">
+        <div class="welcome-portrait"><img src="./assets/teresa.png" alt="特蕾莎的头像"></div>
+        <h2>今天想聊点什么？</h2>
+        <p class="welcome-description">中文、英文，或者混着说，都没关系。<br>从你想分享的一件小事开始吧。</p>
+      </section>
+      <section id="message-list" class="message-list" role="log" aria-label="聊天消息" aria-live="polite" aria-relevant="additions" hidden></section>
+    </div>
+
+    <section class="composer-area" aria-label="输入消息">
+      <div class="inline-error" id="chat-error" role="alert" hidden></div>
+      <form id="chat-form" class="composer">
+        <label class="sr-only" for="message-input">发给特蕾莎的消息</label>
+        <textarea id="message-input" rows="2" maxlength="12000" placeholder="想聊什么？从一句不完美的英语开始也很好。"></textarea>
+        <div class="composer-toolbar"><span><svg class="icon"><use href="#i-spark"/></svg> 放轻松，慢慢说</span><div><span class="keyboard-tip">Enter 发送 · Shift + Enter 换行</span><button type="submit" id="send-button" class="send-button" aria-label="发送消息" disabled><svg class="icon"><use href="#i-arrow"/></svg></button><button type="button" id="stop-button" class="stop-button" hidden>停止等待 <span>■</span></button></div></div>
+      </form>
+      <p class="composer-footnote">页面记录暂未保存，刷新或关闭后会清空。</p>
+    </section>
+  </main>
+
+  <div id="toast" class="toast" role="status" hidden></div>
+</body>
+</html>
