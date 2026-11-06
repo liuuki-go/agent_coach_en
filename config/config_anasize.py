@@ -1,14 +1,12 @@
-"解析json配置"
 from pathlib import Path
 
 import yaml
 
-_config = None
+
+_config: dict | None = None
 
 
-def load_config():
-    global _config
-
+def load_config() -> dict:
     config_path = Path(__file__).resolve().parent / "sys_config.yaml"
 
     with config_path.open("r", encoding="utf-8") as file:
@@ -17,16 +15,17 @@ def load_config():
     if not isinstance(data, dict):
         raise ValueError("配置文件最外层必须是键值结构")
 
-    _config = data
+    return data
 
 
-def get_config():
+def get_config() -> dict:
+    global _config
+
     if _config is None:
-        load_config()
+        _config = load_config()
+
     return _config
 
+
 def get_config_value(key, default=None):
-    if _config is None:
-        load_config()
-    
-    return _config.get(key, default)
+    return get_config().get(key, default)

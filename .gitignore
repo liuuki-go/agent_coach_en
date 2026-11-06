@@ -1,0 +1,7 @@
+/target
+/data/*
+/tests/*
+/output/*
+/.vscode/*
+__pycache__/
+*.py[cod]

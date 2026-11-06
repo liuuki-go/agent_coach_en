@@ -571,12 +571,15 @@ button[hidden],[hidden] {
 .message-content {
   font-size:14px;
   line-height:1.95;
+  padding:12px 17px;
+  border:1px solid var(--line);
+  border-radius:0 13px 13px 13px;
   overflow-wrap:anywhere;
   white-space:pre-wrap
 }
 
 .message.user {
-  justify-content:flex-end;
+  justify-content:flex-start;
   flex-direction:row-reverse
 }
 
@@ -585,10 +588,9 @@ button[hidden],[hidden] {
 }
 
 .message.user .message-content {
-  background:#e8edde;
-  border:1px solid #dee5d2;
+  background:#95ec69;
+  border-color:#89d961;
   border-radius:13px 0 13px 13px;
-  padding:12px 17px;
   font-size:13px
 }
 
@@ -597,7 +599,7 @@ button[hidden],[hidden] {
 }
 
 .message.assistant .message-content {
-  padding:2px 0
+  background:#fff
 }
 
 .message-content code {

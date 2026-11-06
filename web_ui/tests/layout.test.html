@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="UTF-8">
+<title>Teresa 消息布局回归测试</title>
+<h1>消息布局回归测试</h1>
+<p>加载实际页面、样式和消息渲染代码；API 与浏览器存储仅在测试 iframe 内隔离。</p>
+<pre id="results" role="status">正在测试…</pre>
+<script type="module">
+const results = document.querySelector("#results");
+const messages = [
+  { role: "user", content: "你好" },
+  { role: "assistant", content: "你好！" },
+  { role: "user", content: "今天想练习英语。\n".repeat(6) },
+  { role: "assistant", content: "可以从日常生活开始。\n\n**慢慢说**，我在听。" },
+  { role: "user", content: "https://example.com/" + "long-path".repeat(60) },
+  { role: "assistant", content: "word".repeat(180) },
+  { role: "user", content: "```text\n" + "long code line ".repeat(60) + "\n```" },
+  { role: "assistant", content: "```text\n" + "long code line ".repeat(60) + "\n```" },
+];
+const source = await (await fetch("../index.html", { cache: "no-store" })).text();
+const base = new URL("../", location.href).href;
+const fixtureScript = `<script>
+  const session = {
+    id: "11111111-1111-4111-8111-111111111111", title: "布局测试",
+    created_at: "2026-11-05T12:00:00Z", updated_at: "2026-11-05T12:00:00Z"
+  };
+  Object.defineProperty(window, "localStorage", { value: {
+    getItem() { return null; }, setItem() {}
+  } });
+  window.fetch = async (url) => {
+    if (url === "/api/sessions/getAllSessions") return Response.json([session]);
+    if (url === "/api/sessions/getSessionById") return Response.json(session);
+    if (url === "/api/sessions/getSessionMessages") return Response.json(${JSON.stringify(messages)});
+    if (url === "/api/chat") return new Promise(() => {});
+    throw new Error("测试不允许其他 API 请求: " + url);
+  };
+<\/script>`;
+
+function assert(condition, message) {
+  if (!condition) throw new Error(message);
+}
+
+async function waitFor(condition) {
+  const deadline = Date.now() + 5000;
+  while (!condition()) {
+    assert(Date.now() < deadline, "等待实际页面渲染超时");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
+function checkMessages(view) {
+  const doc = view.document;
+  for (const row of doc.querySelectorAll(".message")) {
+    const isUser = row.classList.contains("user");
+    const label = isUser ? "用户" : "AI";
+    const bounds = row.getBoundingClientRect();
+    const avatar = row.querySelector(".message-avatar").getBoundingClientRect();
+    const content = row.querySelector(".message-content");
+    const bubble = content.getBoundingClientRect();
+    const gap = parseFloat(view.getComputedStyle(row).columnGap);
+    const close = (left, right) => Math.abs(left - right) < 1;
+    assert(close(isUser ? avatar.right : avatar.left, isUser ? bounds.right : bounds.left), `${label}头像未靠${isUser ? "右" : "左"}`);
+    assert(close(isUser ? bubble.right + gap : bubble.left - gap, isUser ? avatar.left : avatar.right), `${label}气泡与头像位置错误`);
+    assert(bubble.left >= bounds.left - 1 && bubble.right <= bounds.right + 1, `${label}长内容溢出消息行`);
+    assert(view.getComputedStyle(content).backgroundColor === (isUser ? "rgb(149, 236, 105)" : "rgb(255, 255, 255)"), `${label}气泡颜色错误`);
+    assert(parseFloat(view.getComputedStyle(content).paddingLeft) > 0, `${label}气泡缺少内边距`);
+  }
+  const scroll = doc.querySelector("#conversation-scroll");
+  assert(scroll.scrollWidth <= scroll.clientWidth + 1, "聊天区域出现横向溢出");
+  assert(doc.documentElement.scrollWidth <= view.innerWidth + 1, "页面出现横向溢出");
+}
+
+results.textContent = "";
+let failures = 0;
+for (const width of [320, 390, 1280, 1920]) {
+  const frame = document.createElement("iframe");
+  frame.style.cssText = `width:${width}px;height:900px;border:0`;
+  frame.title = `${width}px 布局测试`;
+  frame.srcdoc = source.replace("<head>", `<head><base href="${base}">${fixtureScript}`);
+  document.body.append(frame);
+  try {
+    await waitFor(() => frame.contentDocument.querySelectorAll(".message").length === messages.length
+      && !frame.contentDocument.querySelector("#message-input").disabled);
+    checkMessages(frame.contentWindow);
+    const input = frame.contentDocument.querySelector("#message-input");
+    input.value = "等待回复时也要保持左右布局";
+    input.dispatchEvent(new frame.contentWindow.Event("input"));
+    frame.contentDocument.querySelector("#chat-form").requestSubmit();
+    await waitFor(() => frame.contentDocument.querySelector(".typing"));
+    checkMessages(frame.contentWindow);
+    results.textContent += `PASS ${width}px：长短消息、多行、长链接、代码块和等待回复的左右位置、颜色与溢出检查\n`;
+  } catch (error) {
+    failures++;
+    results.textContent += `FAIL ${width}px：${error.message}\n`;
+  } finally {
+    frame.remove();
+  }
+}
+document.documentElement.dataset.testStatus = failures ? "failed" : "passed";
+results.textContent += failures ? `${failures} 个视口失败` : "全部 4 个视口通过";
+</script>
+</html>

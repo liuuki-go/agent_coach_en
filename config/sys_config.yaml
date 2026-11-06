@@ -1,0 +1,15 @@
+
+GAODE_API_KEY: 6c5808c101ba29c0418f33cd68c9bd62
+
+Data_Base:
+  host: 127.0.0.1
+  port: 5432
+  user: agent_app
+  password: Qwe060422.
+  database: agent_test
+
+MODEL_CONFIG:
+  model_name: qwen3.5:4b-q4_K_M
+  temperature: 0.0
+  max_tokens: 2048
+  base_url: http://localhost:11434

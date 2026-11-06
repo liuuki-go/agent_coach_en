@@ -1,4 +1,4 @@
-import { sendChat } from "./api.js";
+import { createSession, getSession, getSessionMessages, listSessions, sendChat } from "./api.js?v=history-2";
 
 const $ = (selector) => document.querySelector(selector);
 const input = $("#message-input");
@@ -6,7 +6,9 @@ const messageList = $("#message-list");
 const threads = [];
 let activeThread;
 let pending = null;
+let loading = false;
 let toastTimer;
+const ACTIVE_SESSION_KEY = "teresa.activeSessionId";
 
 function icon(name) {
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
@@ -32,19 +34,109 @@ function closeSidebar() {
   $("#menu-toggle").setAttribute("aria-expanded", "false");
 }
 
-function newThread() {
-  if (pending) return;
-  if (activeThread && activeThread.messages.length === 0) {
-    activeThread.draft = "";
+function showError(text) {
+  const alert = $("#chat-error");
+  alert.textContent = text;
+  alert.hidden = !text;
+}
+
+function savedSessionId() {
+  try { return localStorage.getItem(ACTIVE_SESSION_KEY); } catch { return null; }
+}
+
+function rememberSession(id) {
+  try { localStorage.setItem(ACTIVE_SESSION_KEY, id); } catch { /* 会话列表仍可从后端读取。 */ }
+}
+
+function upsertThread(session) {
+  let thread = threads.find((item) => item.id === session.id);
+  if (thread) {
+    Object.assign(thread, session);
   } else {
-    activeThread = { id: crypto.randomUUID(), title: "新的英语时光", messages: [], draft: "" };
-    threads.unshift(activeThread);
+    thread = { ...session, messages: [], draft: "", historyAvailable: false };
+    threads.push(thread);
   }
-  input.value = "";
-  $("#chat-error").hidden = true;
+  threads.sort((left, right) => right.updatedAt - left.updatedAt);
+  return thread;
+}
+
+async function refreshThread(thread) {
+  const session = await getSession(thread.id);
+  const messages = await getSessionMessages(thread.id);
+  upsertThread(session);
+  thread.messages = messages;
+  thread.historyAvailable = true;
+}
+
+async function selectThread(thread) {
+  if (pending || loading) return;
+  if (activeThread) activeThread.draft = input.value;
+  loading = true;
+  showError("");
   render();
-  closeSidebar();
-  input.focus();
+  try {
+    await refreshThread(thread);
+    activeThread = thread;
+    rememberSession(thread.id);
+    input.value = thread.draft;
+    closeSidebar();
+  } catch (error) {
+    showError(error.message);
+  } finally {
+    loading = false;
+    render();
+    input.focus();
+  }
+}
+
+async function newThread() {
+  if (pending || loading) return;
+  if (activeThread) activeThread.draft = input.value;
+  loading = true;
+  showError("");
+  render();
+  try {
+    const session = await createSession();
+    activeThread = upsertThread(session);
+    activeThread.historyAvailable = true;
+    rememberSession(session.id);
+    input.value = "";
+    closeSidebar();
+  } catch (error) {
+    showError(error.message);
+  } finally {
+    loading = false;
+    render();
+    input.focus();
+  }
+}
+
+async function reloadThreads() {
+  if (pending || loading) return;
+  if (activeThread) activeThread.draft = input.value;
+  loading = true;
+  showError("");
+  render();
+  try {
+    const sessions = await listSessions();
+    const ids = new Set(sessions.map((session) => session.id));
+    for (let index = threads.length - 1; index >= 0; index--) {
+      if (!ids.has(threads[index].id)) threads.splice(index, 1);
+    }
+    sessions.forEach(upsertThread);
+    if (threads.length === 0) upsertThread(await createSession());
+    const preferredId = activeThread?.id ?? savedSessionId();
+    const thread = threads.find((item) => item.id === preferredId) ?? threads[0];
+    await refreshThread(thread);
+    activeThread = thread;
+    rememberSession(thread.id);
+    input.value = thread.draft;
+  } catch (error) {
+    showError(error.message);
+  } finally {
+    loading = false;
+    render();
+  }
 }
 
 function renderThreads() {
@@ -54,22 +146,13 @@ function renderThreads() {
   for (const thread of threads) {
     const button = document.createElement("button");
     button.className = `thread-button${thread === activeThread ? " active" : ""}`;
-    button.disabled = Boolean(pending);
+    button.disabled = Boolean(pending) || loading;
     if (thread === activeThread) button.setAttribute("aria-current", "page");
     const name = document.createElement("span");
     name.className = "thread-name";
     name.textContent = thread.title;
     button.append(icon("chat"), name);
-    button.addEventListener("click", () => {
-      if (pending) return;
-      activeThread.draft = input.value;
-      activeThread = thread;
-      input.value = thread.draft;
-      $("#chat-error").hidden = true;
-      render();
-      closeSidebar();
-      input.focus();
-    });
+    button.addEventListener("click", () => selectThread(thread));
     list.append(button);
   }
 }
@@ -126,10 +209,12 @@ function renderMessage(message, isTyping = false) {
   const name = document.createElement("span");
   name.textContent = message.role === "assistant" ? "Teresa" : "你";
   meta.append(name);
-  const time = document.createElement("time");
-  time.dateTime = message.createdAt.toISOString();
-  time.textContent = message.createdAt.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
-  meta.append(time);
+  if (message.createdAt instanceof Date) {
+    const time = document.createElement("time");
+    time.dateTime = message.createdAt.toISOString();
+    time.textContent = message.createdAt.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
+    meta.append(time);
+  }
   const content = document.createElement("div");
   content.className = "message-content";
   if (isTyping) {
@@ -163,17 +248,22 @@ function renderMessage(message, isTyping = false) {
 }
 
 function render() {
-  const busy = Boolean(pending);
+  const busy = Boolean(pending) || loading;
   $("#new-chat").disabled = busy;
-  $("#send-button").hidden = busy;
-  $("#send-button").disabled = !input.value.trim();
-  $("#stop-button").hidden = !busy;
-  input.disabled = busy;
+  $("#reload-history").disabled = busy;
+  $("#send-button").hidden = Boolean(pending);
+  $("#send-button").disabled = busy || !activeThread || !input.value.trim();
+  $("#stop-button").hidden = !pending;
+  input.disabled = busy || !activeThread;
   renderThreads();
-  const messages = pending ? [...activeThread.messages, pending.user] : activeThread.messages;
+  const history = activeThread?.messages ?? [];
+  const messages = pending ? [...history, pending.user] : history;
   $("#welcome").hidden = messages.length > 0;
   messageList.hidden = messages.length === 0;
   messageList.setAttribute("aria-busy", String(busy));
+  $("#history-note").textContent = activeThread
+    ? loading ? "正在读取会话和历史消息…" : "切换会话或刷新页面会重新读取已保存的消息。"
+    : loading ? "正在读取会话和历史消息…" : "请选择会话后开始聊天。";
   messageList.replaceChildren(...messages.map((message) => renderMessage(message)));
   if (pending) {
     messageList.append(renderMessage({ role: "assistant", createdAt: new Date() }, true));
@@ -191,7 +281,7 @@ function resizeInput() {
 $("#chat-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const text = input.value.trim();
-  if (pending || !text) return;
+  if (pending || loading || !activeThread || !text) return;
   const thread = activeThread;
   const request = {
     user: { role: "user", content: text, createdAt: new Date() },
@@ -201,38 +291,53 @@ $("#chat-form").addEventListener("submit", async (event) => {
   pending = request;
   input.value = "";
   thread.draft = "";
-  $("#chat-error").hidden = true;
+  showError("");
   render();
   const timer = setTimeout(() => {
     request.stopReason = "timeout";
     request.controller.abort();
   }, 120000);
   try {
-    const reply = await sendChat([...thread.messages, request.user], { signal: request.controller.signal });
-    // 只有请求成功才提交这一轮，失败重试不会重复发送用户消息。
+    const reply = await sendChat(thread.id, text, { signal: request.controller.signal });
+    clearTimeout(timer);
     thread.messages.push(request.user, {
       role: "assistant", content: reply, createdAt: new Date(),
     });
-    if (thread.messages.length === 2) thread.title = text.slice(0, 20);
+    pending = null;
+    loading = true;
+    render();
+    try {
+      const messages = await getSessionMessages(thread.id);
+      const last = messages.slice(-2);
+      if (last[0]?.role === "user" && last[0].content === text
+        && last[1]?.role === "assistant" && last[1].content === reply) {
+        thread.messages = messages;
+        thread.historyAvailable = true;
+      } else {
+        showError("回复已收到，但已保存的历史暂未包含本轮回复。当前回复仍保留在页面，请稍后刷新确认。");
+      }
+    } catch (error) {
+      showError(`回复已收到，但历史同步失败：${error.message} 当前回复仍保留在页面，请稍后刷新确认。`);
+    }
   } catch (error) {
     thread.draft = text;
-    input.value = text;
-    const alert = $("#chat-error");
-    alert.textContent = request.stopReason === "timeout"
-      ? "等待超过两分钟。消息已放回输入框，你可以稍后重试。"
+    showError(request.stopReason === "timeout"
+      ? "等待超过两分钟，后端可能仍在处理。消息已放回输入框，重新发送可能重复执行。"
       : request.stopReason === "user"
-        ? "已停止等待，服务端可能仍在处理。消息已放回输入框。"
-        : error.message;
-    alert.hidden = false;
+        ? "已停止等待，后端可能仍在处理。消息已放回输入框，重新发送可能重复执行。"
+        : `${error.message} 消息已放回输入框，后端可能已执行，重新发送可能重复执行。`);
   } finally {
     clearTimeout(timer);
     pending = null;
+    loading = false;
+    input.value = thread.draft;
     render();
     input.focus();
   }
 });
 
 input.addEventListener("input", () => {
+  if (!activeThread) return;
   activeThread.draft = input.value;
   $("#send-button").disabled = !input.value.trim();
   resizeInput();
@@ -249,6 +354,7 @@ $("#stop-button").addEventListener("click", () => {
   pending.controller.abort();
 });
 $("#new-chat").addEventListener("click", () => newThread());
+$("#reload-history").addEventListener("click", () => reloadThreads());
 $("#menu-toggle").addEventListener("click", () => {
   const open = $("#sidebar").classList.toggle("open");
   $("#sidebar-scrim").hidden = !open;
@@ -259,4 +365,5 @@ document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") closeSidebar();
 });
 
-newThread();
+render();
+export const ready = reloadThreads();

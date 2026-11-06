@@ -1,5 +1,8 @@
-// 对接 service/web_server.py：发送 { content: "..." }，后端补上 user 角色。
 export const CHAT_ENDPOINT = "/api/chat";
+export const SESSION_LIST_ENDPOINT = "/api/sessions/getAllSessions";
+export const SESSION_DETAIL_ENDPOINT = "/api/sessions/getSessionById";
+export const SESSION_CREATE_ENDPOINT = "/api/sessions/createSession";
+export const SESSION_MESSAGES_ENDPOINT = "/api/sessions/getSessionMessages";
 
 export class ChatApiError extends Error {
   constructor(message, status = 0) {
@@ -9,30 +12,42 @@ export class ChatApiError extends Error {
   }
 }
 
-export function buildChatRequest(messages) {
-  if (!Array.isArray(messages) || messages.length === 0) {
-    throw new ChatApiError("请先输入一条消息。");
-  }
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-  const message = messages.at(-1);
-  if (message?.role !== "user") {
-    throw new ChatApiError("最后一条消息应当来自用户。");
+function requireId(value) {
+  if (typeof value !== "string" || !UUID_PATTERN.test(value)) {
+    throw new ChatApiError("会话标识无效，请重新加载会话。");
   }
-  if (typeof message.content !== "string" || !message.content.trim()) {
-    throw new ChatApiError("消息内容不能为空。");
-  }
-  // 当前后端仅接收单条消息，历史记录和 UI 字段保留在页面内。
-  return { content: message.content };
+  return value;
 }
 
-export async function sendChat(messages, { signal, fetchImpl = globalThis.fetch } = {}) {
-  const body = buildChatRequest(messages);
+function parseDate(value) {
+  const date = new Date(value);
+  if (typeof value !== "string" || Number.isNaN(date.getTime())) {
+    throw new ChatApiError("接口返回的会话时间无效。");
+  }
+  return date;
+}
+
+function parseSession(session) {
+  if (typeof session?.title !== "string") {
+    throw new ChatApiError("接口没有返回有效的会话信息。");
+  }
+  return {
+    id: requireId(session.id),
+    title: session.title,
+    createdAt: parseDate(session.created_at),
+    updatedAt: parseDate(session.updated_at),
+  };
+}
+
+async function requestJson(url, { method = "GET", body, signal, fetchImpl = globalThis.fetch } = {}) {
   let response;
   try {
-    response = await fetchImpl(CHAT_ENDPOINT, {
-      method: "POST",
+    response = await fetchImpl(url, {
+      method,
       headers: { "Content-Type": "application/json", Accept: "application/json" },
-      body: JSON.stringify(body),
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       signal,
     });
   } catch (error) {
@@ -44,23 +59,67 @@ export async function sendChat(messages, { signal, fetchImpl = globalThis.fetch 
   try {
     data = await response.json();
   } catch {
-    const message = response.ok
-      ? "接口需要返回 JSON 字符串，例如：\"你好\"。"
-      : `聊天接口返回 HTTP ${response.status}。请确认已实现 POST /api/chat。`;
-    throw new ChatApiError(message, response.status);
+    throw new ChatApiError(`接口返回了无效 JSON（HTTP ${response.status}）。`, response.status);
   }
-
   if (!response.ok) {
     const detail = typeof data?.detail === "string" ? data.detail : data?.error;
     throw new ChatApiError(
-      typeof detail === "string" ? detail : `聊天请求失败（HTTP ${response.status}）。`,
+      typeof detail === "string" ? detail : `请求失败（HTTP ${response.status}）。`,
       response.status,
     );
   }
-  // FastAPI 直接 return 字符串时，response.json() 得到的就是字符串。
+  return data;
+}
+
+export async function listSessions(options = {}) {
+  const data = await requestJson(SESSION_LIST_ENDPOINT, options);
+  if (!Array.isArray(data)) throw new ChatApiError("接口没有返回有效的会话列表。");
+  return data.map(parseSession);
+}
+
+export async function createSession(options = {}) {
+  const data = await requestJson(SESSION_CREATE_ENDPOINT, { ...options, method: "POST", body: {} });
+  return parseSession(data?.session_id);
+}
+
+export async function getSession(sessionId, options = {}) {
+  const data = await requestJson(SESSION_DETAIL_ENDPOINT, {
+    ...options, method: "POST", body: { session_id: requireId(sessionId) },
+  });
+  const session = parseSession(data);
+  if (session.id !== sessionId) throw new ChatApiError("接口返回的会话信息不匹配。");
+  return session;
+}
+
+export async function getSessionMessages(sessionId, options = {}) {
+  const data = await requestJson(SESSION_MESSAGES_ENDPOINT, {
+    ...options, method: "POST", body: { session_id: requireId(sessionId) },
+  });
+  if (!Array.isArray(data)) throw new ChatApiError("接口没有返回有效的历史消息列表。");
+  return data.map((message) => {
+    if (!message || !["user", "assistant"].includes(message.role)
+      || typeof message.content !== "string" || !message.content.trim()
+      || (message.id !== null && message.id !== undefined && typeof message.id !== "string")) {
+      throw new ChatApiError("接口返回的历史消息格式无效。");
+    }
+    return { id: message.id ?? null, role: message.role, content: message.content };
+  });
+}
+
+export function buildChatRequest(sessionId, content) {
+  if (typeof content !== "string" || !content.trim()) {
+    throw new ChatApiError("消息内容不能为空。");
+  }
+  if (content.trim().length > 12000) throw new ChatApiError("消息内容不能超过 12000 个字符。");
+  return { session_id: requireId(sessionId), content: content.trim() };
+}
+
+export async function sendChat(sessionId, content, options = {}) {
+  const body = buildChatRequest(sessionId, content);
+  const data = await requestJson(CHAT_ENDPOINT, { ...options, method: "POST", body });
   const reply = typeof data === "string" ? data : data?.reply;
   if (typeof reply !== "string" || !reply.trim()) {
-    throw new ChatApiError("接口没有返回有效回复，请检查后端 invoke() 的返回值。", response.status);
+    throw new ChatApiError("接口没有返回有效的文字回复。");
   }
   return reply;
 }

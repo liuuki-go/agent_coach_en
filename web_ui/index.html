@@ -7,8 +7,8 @@
   <meta name="description" content="和特蕾莎聊生活，在轻松的对话中练习英语。">
   <title>Teresa · 你的日常英语伙伴</title>
   <link rel="icon" href="./assets/flower.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="./styles.css">
-  <script type="module" src="./app.js"></script>
+  <link rel="stylesheet" href="./styles.css?v=chat-bubbles-1">
+  <script type="module" src="./app.js?v=history-2"></script>
 </head>
 <body>
   <svg class="icon-library" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
@@ -19,6 +19,7 @@
     <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="3"/><path d="M15 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h3"/></symbol>
     <symbol id="i-spark" viewBox="0 0 24 24"><path d="m12 3 2.5 6.5L21 12l-6.5 2.5L12 21l-2.5-6.5L3 12l6.5-2.5Z"/></symbol>
     <symbol id="i-leaf" viewBox="0 0 24 24"><path d="M20 4C9 2 3 7 5 14s15 8 15-10Z"/><path d="M4 21 15 10"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 7v5h-5M4 17v-5h5"/><path d="M6 7a7 7 0 0 1 12-1l2 3M4 15l2 3a7 7 0 0 0 12-1"/></symbol>
   </svg>
 
   <button class="sidebar-scrim" id="sidebar-scrim" aria-label="关闭侧边栏" hidden></button>
@@ -29,7 +30,7 @@
     </a>
     <button class="new-chat" id="new-chat"><svg class="icon"><use href="#i-plus"/></svg> 开始新的对话 <kbd>＋</kbd></button>
     <div class="history-heading">最近的对话 <span id="thread-count">01</span></div>
-    <nav id="thread-list" class="thread-list" aria-label="当前页面的聊天记录"></nav>
+    <nav id="thread-list" class="thread-list" aria-label="已保存的会话列表"></nav>
     <div class="sidebar-note">
       <svg class="icon"><use href="#i-leaf"/></svg>
       <p>A little progress,<br><em>every single day.</em></p>
@@ -37,7 +38,7 @@
     </div>
     <div class="sidebar-bottom">
       <div class="learner-avatar">你</div>
-      <div><strong>我的英语时光</strong><span>对话仅保留在当前页面</span></div>
+      <div><strong>我的英语时光</strong><span>会话列表保存在服务端</span></div>
       <span class="small-spark">✳</span>
     </div>
   </aside>
@@ -49,6 +50,7 @@
         <div class="header-avatar"><img src="./assets/teresa.png" alt=""></div>
         <div><h1>特蕾莎 <span>Teresa</span></h1><p>你的日常英语伙伴</p></div>
       </div>
+      <button id="reload-history" class="icon-button" aria-label="刷新会话和历史消息" title="刷新会话和历史消息"><svg class="icon"><use href="#i-refresh"/></svg></button>
     </header>
 
     <div class="conversation-scroll" id="conversation-scroll">
@@ -67,7 +69,7 @@
         <textarea id="message-input" rows="2" maxlength="12000" placeholder="想聊什么？从一句不完美的英语开始也很好。"></textarea>
         <div class="composer-toolbar"><span><svg class="icon"><use href="#i-spark"/></svg> 放轻松，慢慢说</span><div><span class="keyboard-tip">Enter 发送 · Shift + Enter 换行</span><button type="submit" id="send-button" class="send-button" aria-label="发送消息" disabled><svg class="icon"><use href="#i-arrow"/></svg></button><button type="button" id="stop-button" class="stop-button" hidden>停止等待 <span>■</span></button></div></div>
       </form>
-      <p class="composer-footnote">页面记录暂未保存，刷新或关闭后会清空。</p>
+      <p class="composer-footnote" id="history-note" role="status">切换会话或刷新页面会重新读取已保存的消息。</p>
     </section>
   </main>
 
