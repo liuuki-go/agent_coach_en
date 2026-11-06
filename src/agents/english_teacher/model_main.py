@@ -40,6 +40,10 @@ def invoke(user_message: dict[str, str], agent: AgentGraph,session_id) -> str:
     if not isinstance(reply, str) or not reply.strip():
         raise RuntimeError("Agent 没有返回有效的文字回复")
 
+
+
+    return reply
+
     return reply
 
 

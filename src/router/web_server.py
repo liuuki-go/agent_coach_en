@@ -1,5 +1,4 @@
 from fastapi import FastAPI, HTTPException
-from uvicorn import run
 from src.agents.english_teacher.model_main import invoke
 from contextlib import asynccontextmanager
 
@@ -18,6 +17,13 @@ from langchain_core.runnables import RunnableConfig
 
 from src.domains.session_domain import SessionMessageResponse
 from src.agent_tools.common_tool import common_tools
+from common.agent_lock import SessionLocks
+import logging
+
+import httpx
+from ollama import ResponseError
+
+logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -59,6 +65,7 @@ async def lifespan(app: FastAPI):
         app.state.checkpointer = checkpointer
         app.state.agent = agent
         app.state.session_store = session_store
+        app.state.session_locks = SessionLocks()
         yield
 
     finally:
@@ -83,25 +90,84 @@ def health():
 #执行聊天
 @app.post("/api/chat")
 def chat(request: UserMessage):
+    # 检查会话存在，不存在则报错结束本次业务
     session_store: SessionStore = app.state.session_store
-    valid = valid_chat_request(request)
-    if not valid:
-        raise HTTPException(status_code=400, detail="请求参数无效")
-
     if session_store.get_session(request.session_id) is None:
         raise HTTPException(status_code=404, detail="会话不存在")
+    
+    lock = app.state.session_locks.get(request.session_id)
 
-    agent: AgentGraph = app.state.agent
-    user_message = {
-        "role": "user",
-        "content": request.content,
-    }
+    if not lock.acquire(blocking=False):
+        raise HTTPException(
+            status_code=409,
+            detail="当前会话正在处理消息，请等待完成",
+        )
 
-    return invoke(
-        user_message=user_message,
-        agent=agent,
-        session_id=request.session_id,
-    )
+    try:
+        # 在这里执行：
+        # 会话存在检查 → Agent 调用及异常处理 → 更新时间 → 返回回复
+        
+    
+        valid = valid_chat_request(request)
+        if not valid:
+            raise HTTPException(status_code=400, detail="请求参数无效")
+    
+    
+    
+        agent: AgentGraph = app.state.agent
+        user_message = {
+            "role": "user",
+            "content": request.content,
+        }
+    
+        try:
+            reply = invoke(
+                user_message=user_message,
+                agent=agent,
+                session_id=request.session_id,
+            )
+            #更新会话时间
+            updated = session_store.touch_session(request.session_id)
+            if not updated:
+                logger.warning(
+                    "session_touch_missing session_id=%s",
+                    request.session_id,
+                )
+    
+        except httpx.TimeoutException:
+            raise HTTPException(
+                status_code=504,
+                detail="模型响应超时，请稍后查询历史确认结果",
+            ) from None
+        except (httpx.RequestError, ConnectionError):
+            raise HTTPException(
+                status_code=503,
+                detail="暂时无法连接模型服务",
+            ) from None
+        except ResponseError:
+            raise HTTPException(
+                status_code=502,
+                detail="模型服务返回异常",
+            ) from None
+        except Exception as exc:
+            logger.error(
+                "chat_failed session_id=%s error_type=%s",
+                request.session_id,
+                type(exc).__name__,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="聊天处理失败，请稍后查询历史确认结果",
+            ) from None
+    
+        return reply
+
+    finally:
+        lock.release()
+
+
+
+ 
 
 
 from src.domains.session_domain import GetSessionByIdRequest

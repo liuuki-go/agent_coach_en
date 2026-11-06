@@ -1,18 +1,20 @@
 from langchain_ollama import ChatOllama
 from config.config_anasize import get_config_value
-
+import httpx
 
 _model: ChatOllama | None = None
 
 def build_model(model_name: str,base_url: str,temperature: float=0,switch_model: bool=False)-> ChatOllama:
     global _model
 
-    if _model is None or switch_model:
-        _model = ChatOllama(
-            model=model_name,
-            base_url=base_url,
-            temperature=temperature,
-        )
+    _model = ChatOllama(
+        model=model_name,
+        base_url=base_url,
+        temperature=temperature,
+        client_kwargs={
+            "timeout": httpx.Timeout(60.0, connect=5.0),
+        },
+)
     return _model
 
 

@@ -57,3 +57,15 @@ class SessionStore:
                 """,
                 (session_id,),
             ).fetchone()
+
+    def touch_session(self, session_id: UUID) -> bool:
+        with self.pool.connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE chat_sessions
+                SET updated_at = now()
+                WHERE id = %s
+                """,
+                (session_id,),
+            )
+            return cursor.rowcount == 1

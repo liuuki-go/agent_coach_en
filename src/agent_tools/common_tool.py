@@ -23,17 +23,4 @@ weather_tool = StructuredTool.from_function(
 # 定义工具列表
 common_tools = [current_time_tool, weather_tool]
 
-# excute tool
-def execute_tool(name, arguments):
-    try:
-        if name == "get_current_time":
-            return get_current_time(arguments["timezone"])
-        elif name == "get_weather":
-            return get_weather(arguments["city"])
-        else:
-            return f"工具执行失败：不支持工具 {name}"
-    except Exception as e:
-        return f"工具执行失败: {e}"
-
-
 
