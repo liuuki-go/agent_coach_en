@@ -465,6 +465,149 @@ button[hidden],[hidden] {
   gap:15px
 }
 
+.composer-toolbar>.model-selector {
+  position:relative;
+  display:block;
+  min-width:0;
+  max-width:calc(100% - 50px)
+}
+
+.composer-toolbar>div:last-child {
+  flex-shrink:0
+}
+
+.model-menu-toggle {
+  display:flex;
+  align-items:center;
+  gap:7px;
+  max-width:100%;
+  border:1px solid transparent;
+  border-radius:8px;
+  padding:6px 8px;
+  margin-left:-8px;
+  background:transparent;
+  color:#61745a;
+  font-size:11px
+}
+
+.model-menu-toggle:hover:not(:disabled),.model-menu-toggle[aria-expanded="true"] {
+  background:#edf0e5;
+  border-color:#dfe4d5
+}
+
+.model-menu-toggle>span {
+  min-width:0;
+  max-width:min(35vw,250px);
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap
+}
+
+.model-menu-toggle .icon {
+  width:15px;
+  height:15px
+}
+
+.model-menu-toggle .model-chevron {
+  width:12px;
+  height:12px
+}
+
+.model-menu {
+  position:absolute;
+  left:0;
+  bottom:calc(100% + 12px);
+  z-index:30;
+  width:min(320px,calc(100vw - 64px));
+  max-height:min(360px,50vh);
+  overflow-y:auto;
+  padding:14px;
+  border:1px solid #dce1d2;
+  border-radius:14px;
+  background:#fffef9;
+  box-shadow:0 10px 35px #34472c1a
+}
+
+.model-menu-heading {
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:12px;
+  color:#56634e;
+  font-size:11px;
+  margin-bottom:10px
+}
+
+.model-menu-heading>span {
+  border:1px solid #dce3d1;
+  border-radius:5px;
+  background:#edf1e6;
+  padding:2px 5px;
+  color:#859078;
+  font-size:9px
+}
+
+.model-list {
+  list-style:none;
+  margin:0;
+  padding:0
+}
+
+.model-item {
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:12px;
+  padding:10px 9px;
+  border-radius:8px;
+  cursor:default;
+  overflow-wrap:anywhere
+}
+
+.model-item.current {
+  background:#edf1e6
+}
+
+.model-item>div {
+  min-width:0
+}
+
+.model-item strong {
+  display:block;
+  font-size:12px;
+  font-weight:500
+}
+
+.model-item div>span {
+  display:block;
+  margin-top:3px;
+  color:#939a8b;
+  font-size:10px
+}
+
+.model-check {
+  flex-shrink:0;
+  color:#648350;
+  font-size:16px
+}
+
+.model-menu-note {
+  margin:10px 0 0;
+  padding-top:10px;
+  border-top:1px solid var(--line);
+  color:#919885;
+  font-size:10px;
+  line-height:1.7
+}
+
+.model-status {
+  margin:8px 0 0;
+  color:#9e6047;
+  font-size:10px;
+  line-height:1.7;
+  overflow-wrap:anywhere
+}
+
 .keyboard-tip {
   font-size:9px;
   color:#a6aa9e

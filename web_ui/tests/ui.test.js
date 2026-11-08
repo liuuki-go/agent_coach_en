@@ -34,6 +34,7 @@ class Element {
   get textContent() { return this._text + this.children.map((child) => child.textContent ?? child).join(""); }
   append(...children) { this.children.push(...children); }
   replaceChildren(...children) { this._text = ""; this.children = children; }
+  contains(node) { return node === this || this.children.some((child) => child.contains?.(node)); }
   setAttribute(name, value) { this.attributes.set(name, value); }
   addEventListener(name, callback) {
     if (!this.listeners.has(name)) this.listeners.set(name, []);
@@ -60,10 +61,22 @@ function server(initial = []) {
     calls: [],
     onChat: null,
     onHistory: null,
+    onModels: null,
+    modelCatalog: {
+      default: "model-b",
+      models: [
+        { name: "model-a", display_name: "模型 A" },
+        { name: "model-b", display_name: "模型 B" },
+      ],
+    },
   };
   state.fetch = async (url, options) => {
     const body = options.body && JSON.parse(options.body);
     state.calls.push({ url, method: options.method, body });
+    if (url === "/api/models/getModelList" && options.method === "GET") {
+      if (state.onModels) return state.onModels(options);
+      return Response.json(state.modelCatalog);
+    }
     if (url === "/api/sessions/getAllSessions" && options.method === "GET") {
       return Response.json(state.sessions);
     }
@@ -97,8 +110,9 @@ function server(initial = []) {
   return state;
 }
 
-async function openApp(t, state, storage = new Map()) {
+async function openApp(t, state, storage = new Map(), { waitForModels = true } = {}) {
   const elements = new Map();
+  const listeners = new Map();
   const document = {
     querySelector(selector) {
       if (!elements.has(selector)) elements.set(selector, new Element());
@@ -107,8 +121,20 @@ async function openApp(t, state, storage = new Map()) {
     createElement: (name) => new Element(name),
     createElementNS: (_namespace, name) => new Element(name),
     createTextNode(text) { const node = new Element("text"); node.textContent = text; return node; },
-    addEventListener() {},
+    addEventListener(name, callback) {
+      if (!listeners.has(name)) listeners.set(name, []);
+      listeners.get(name).push(callback);
+    },
+    async emit(name, event) {
+      for (const listener of listeners.get(name) ?? []) await listener(event);
+    },
   };
+  const get = (selector) => document.querySelector(selector);
+  get("#model-selector").append(get("#model-menu-toggle"), get("#model-menu"));
+  get("#model-menu-toggle").append(get("#model-label"));
+  get("#model-menu").append(get("#model-list"));
+  get("#model-menu").hidden = true;
+  get("#model-status").hidden = true;
   const previous = { document: globalThis.document, localStorage: globalThis.localStorage, fetch: globalThis.fetch };
   Object.assign(globalThis, {
     document,
@@ -118,7 +144,8 @@ async function openApp(t, state, storage = new Map()) {
   t.after(() => Object.assign(globalThis, previous));
   const app = await import(`../app.js?ui-test=${++importNumber}`);
   await app.ready;
-  return { get: (selector) => document.querySelector(selector), storage };
+  if (waitForModels) await app.modelsReady;
+  return { get, storage, document, modelsReady: app.modelsReady };
 }
 
 function threadButton(ui, title) {
@@ -132,6 +159,102 @@ function chatCalls(state) {
 function descendants(element) {
   return [element, ...element.children.flatMap(descendants)];
 }
+
+test("模型菜单展示服务端默认项和全部安全文字，其他项不可切换且聊天请求不变", async (t) => {
+  const state = server([session(A, "英语练习")]);
+  state.modelCatalog.models[0].display_name = "<img src=x onerror=alert(1)>";
+  const ui = await openApp(t, state);
+  assert.equal(ui.get("#model-label").textContent, "模型 B");
+  assert.equal(ui.get("#model-menu-toggle").disabled, false);
+  assert.equal(ui.get("#model-menu").hidden, true);
+  await ui.get("#model-menu-toggle").emit("click");
+  assert.equal(ui.get("#model-menu").hidden, false);
+  assert.equal(ui.get("#model-menu-toggle").attributes.get("aria-expanded"), "true");
+  const items = ui.get("#model-list").children;
+  assert.equal(items.length, 2);
+  assert.equal(items[0].attributes.has("aria-current"), false);
+  assert.equal(items[1].attributes.get("aria-current"), "true");
+  assert.match(items[0].textContent, /<img src=x onerror=alert\(1\)>/);
+  assert.equal(descendants(ui.get("#model-list")).some((node) => node.name === "img"), false);
+  const beforeClick = state.calls.length;
+  await items[0].emit("click");
+  assert.equal(state.calls.length, beforeClick);
+  assert.equal(ui.get("#model-label").textContent, "模型 B");
+  assert.equal(items[1].attributes.get("aria-current"), "true");
+  assert.deepEqual([...ui.storage.entries()], [["teresa.activeSessionId", A]]);
+  ui.get("#message-input").value = "正常聊天";
+  await ui.get("#chat-form").emit("submit");
+  assert.deepEqual(chatCalls(state)[0].body, { session_id: A, content: "正常聊天" });
+  assert.deepEqual(state.calls.filter((call) => call.url.startsWith("/api/models/")), [
+    { url: "/api/models/getModelList", method: "GET", body: undefined },
+  ]);
+});
+
+test("模型菜单支持Escape与外部点击关闭，内部点击保持展开", async (t) => {
+  const ui = await openApp(t, server([session(A, "英语练习")]));
+  await ui.get("#model-menu-toggle").emit("click");
+  await ui.document.emit("pointerdown", { target: ui.get("#model-list").children[0] });
+  assert.equal(ui.get("#model-menu").hidden, false);
+  await ui.document.emit("keydown", { key: "Escape" });
+  assert.equal(ui.get("#model-menu").hidden, true);
+  assert.equal(ui.get("#model-menu-toggle").attributes.get("aria-expanded"), "false");
+  await ui.get("#model-menu-toggle").emit("click");
+  await ui.document.emit("pointerdown", { target: ui.get("#message-input") });
+  assert.equal(ui.get("#model-menu").hidden, true);
+  assert.equal(ui.get("#model-menu-toggle").attributes.get("aria-expanded"), "false");
+});
+
+test("模型列表读取失败独立提示，不阻塞历史显示和正常聊天", async (t) => {
+  const state = server([session(A, "英语练习")]);
+  state.histories.set(A, [{ role: "assistant", content: "服务端历史仍可读取" }]);
+  state.onModels = () => Response.json({ detail: "模型配置暂不可用" }, { status: 503 });
+  const ui = await openApp(t, state);
+  assert.equal(ui.get("#model-label").textContent, "模型列表不可用");
+  assert.equal(ui.get("#model-menu-toggle").disabled, true);
+  assert.equal(ui.get("#model-status").hidden, false);
+  assert.match(ui.get("#model-status").textContent, /模型列表读取失败/);
+  assert.match(ui.get("#message-list").textContent, /服务端历史仍可读取/);
+  assert.equal(ui.get("#chat-error").hidden, true);
+  assert.equal(ui.get("#message-input").disabled, false);
+  ui.get("#message-input").value = "模型列表失败时继续聊天";
+  await ui.get("#chat-form").emit("submit");
+  assert.match(ui.get("#message-list").textContent, /Hello!/);
+  assert.deepEqual(chatCalls(state)[0].body, { session_id: A, content: "模型列表失败时继续聊天" });
+  assert.equal(ui.get("#model-status").hidden, false);
+});
+
+test("模型元数据独立异步读取，尚未完成时不显示假默认且会话已可使用", async (t) => {
+  const state = server([session(A, "英语练习")]);
+  let finishModels;
+  state.onModels = () => new Promise((resolve) => { finishModels = resolve; });
+  const ui = await openApp(t, state, new Map(), { waitForModels: false });
+  assert.equal(ui.get("#model-label").textContent, "正在读取模型…");
+  assert.equal(ui.get("#model-menu-toggle").disabled, true);
+  assert.equal(ui.get("#message-input").disabled, false);
+  ui.get("#message-input").value = "无需等待模型列表";
+  await ui.get("#chat-form").emit("submit");
+  assert.match(ui.get("#message-list").textContent, /Hello!/);
+  finishModels(Response.json(state.modelCatalog));
+  await ui.modelsReady;
+  assert.equal(ui.get("#model-label").textContent, "模型 B");
+  assert.equal(ui.get("#model-menu-toggle").disabled, false);
+});
+
+test("重新打开页面以服务端默认模型为准，不持久化本地模型选项", async (t) => {
+  const state = server([session(A, "英语练习")]);
+  const storage = new Map();
+  const ui = await openApp(t, state, storage);
+  assert.equal(ui.get("#model-label").textContent, "模型 B");
+  state.modelCatalog.default = "model-a";
+  await t.test("服务端默认值改变后重新加载", async (child) => {
+    const reopened = await openApp(child, state, storage);
+    assert.equal(reopened.get("#model-label").textContent, "模型 A");
+    assert.equal(reopened.get("#model-list").children[0].attributes.get("aria-current"), "true");
+    assert.equal(reopened.get("#model-list").children[1].attributes.has("aria-current"), false);
+    assert.deepEqual([...storage.entries()], [["teresa.activeSessionId", A]]);
+    assert.equal(state.calls.filter((call) => call.url === "/api/models/getModelList").length, 2);
+  });
+});
 
 test("启动读取已选会话历史，切换会话读取对应消息而不混入", async (t) => {
   const state = server([session(A, "日常英语"), session(B, "面试练习")]);

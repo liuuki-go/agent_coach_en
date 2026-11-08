@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  buildChatRequest, ChatApiError, createSession, getSession, getSessionMessages, listSessions, sendChat,
+  buildChatRequest, ChatApiError, createSession, getModelList, getSession, getSessionMessages, listSessions, sendChat,
 } from "../api.js";
 
 const SESSION = "11111111-1111-4111-8111-111111111111";
@@ -9,6 +9,45 @@ const OTHER = "22222222-2222-4222-8222-222222222222";
 const CREATED = "2026-11-05T12:00:00Z";
 const session = { id: SESSION, title: "英语练习", created_at: CREATED, updated_at: CREATED };
 const optionsFor = (data, status = 200) => ({ fetchImpl: async () => Response.json(data, { status }) });
+
+test("只读模型列表使用GET，默认模型可以不在第一项且只返回公开字段", async () => {
+  const catalog = await getModelList({
+    fetchImpl: async (url, options) => {
+      assert.equal(url, "/api/models/getModelList");
+      assert.equal(options.method, "GET");
+      assert.equal(options.body, undefined);
+      return Response.json({
+        default: "model-b",
+        models: [
+          { name: "model-a", display_name: "模型 A" },
+          { name: "model-b", display_name: "模型 B", base_url: "private" },
+        ],
+      });
+    },
+  });
+  assert.deepEqual(catalog, {
+    default: "model-b",
+    models: [
+      { name: "model-a", displayName: "模型 A" },
+      { name: "model-b", displayName: "模型 B" },
+    ],
+  });
+});
+
+test("模型列表拒绝缺失默认项、未知默认项、空列表和错误数据结构", async () => {
+  const model = { name: "model-a", display_name: "模型 A" };
+  for (const data of [
+    null, [], {}, { models: [model] }, { default: "", models: [model] },
+    { default: "model-b", models: [model] }, { default: "model-a", models: [] },
+    { default: "model-a", models: [model, model] },
+    { default: "model-a", models: [null] },
+    { default: "model-a", models: [{ name: "model-a", display_name: " " }] },
+  ]) {
+    await assert.rejects(getModelList(optionsFor(data)), ChatApiError);
+  }
+  await assert.rejects(getModelList(optionsFor({ detail: "模型配置不可用" }, 503)),
+    (error) => error instanceof ChatApiError && error.status === 503);
+});
 
 test("聊天只发送当前后端支持的会话ID和本次内容，接受JSON字符串响应", async () => {
   const reply = await sendChat(SESSION, " hello ", {

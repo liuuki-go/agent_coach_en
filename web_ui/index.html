@@ -7,8 +7,8 @@
   <meta name="description" content="和特蕾莎聊生活，在轻松的对话中练习英语。">
   <title>Teresa · 你的日常英语伙伴</title>
   <link rel="icon" href="./assets/flower.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="./styles.css?v=chat-bubbles-1">
-  <script type="module" src="./app.js?v=history-2"></script>
+  <link rel="stylesheet" href="./styles.css?v=model-list-1">
+  <script type="module" src="./app.js?v=model-list-1"></script>
 </head>
 <body>
   <svg class="icon-library" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
@@ -20,6 +20,7 @@
     <symbol id="i-spark" viewBox="0 0 24 24"><path d="m12 3 2.5 6.5L21 12l-6.5 2.5L12 21l-2.5-6.5L3 12l6.5-2.5Z"/></symbol>
     <symbol id="i-leaf" viewBox="0 0 24 24"><path d="M20 4C9 2 3 7 5 14s15 8 15-10Z"/><path d="M4 21 15 10"/></symbol>
     <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 7v5h-5M4 17v-5h5"/><path d="M6 7a7 7 0 0 1 12-1l2 3M4 15l2 3a7 7 0 0 0 12-1"/></symbol>
+    <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m7 10 5 5 5-5"/></symbol>
   </svg>
 
   <button class="sidebar-scrim" id="sidebar-scrim" aria-label="关闭侧边栏" hidden></button>
@@ -67,8 +68,19 @@
       <form id="chat-form" class="composer">
         <label class="sr-only" for="message-input">发给特蕾莎的消息</label>
         <textarea id="message-input" rows="2" maxlength="12000" placeholder="想聊什么？从一句不完美的英语开始也很好。"></textarea>
-        <div class="composer-toolbar"><span><svg class="icon"><use href="#i-spark"/></svg> 放轻松，慢慢说</span><div><span class="keyboard-tip">Enter 发送 · Shift + Enter 换行</span><button type="submit" id="send-button" class="send-button" aria-label="发送消息" disabled><svg class="icon"><use href="#i-arrow"/></svg></button><button type="button" id="stop-button" class="stop-button" hidden>停止等待 <span>■</span></button></div></div>
+        <div class="composer-toolbar">
+          <div class="model-selector" id="model-selector">
+            <button type="button" class="model-menu-toggle" id="model-menu-toggle" aria-expanded="false" aria-controls="model-menu" disabled><svg class="icon"><use href="#i-spark"/></svg><span id="model-label">正在读取模型…</span><svg class="icon model-chevron"><use href="#i-chevron"/></svg></button>
+            <section class="model-menu" id="model-menu" aria-labelledby="model-menu-title" hidden>
+              <div class="model-menu-heading" id="model-menu-title">已配置的模型<span>仅展示</span></div>
+              <ul class="model-list" id="model-list"></ul>
+              <p class="model-menu-note">当前模型由服务端默认配置决定。</p>
+            </section>
+          </div>
+          <div><span class="keyboard-tip">Enter 发送 · Shift + Enter 换行</span><button type="submit" id="send-button" class="send-button" aria-label="发送消息" disabled><svg class="icon"><use href="#i-arrow"/></svg></button><button type="button" id="stop-button" class="stop-button" hidden>停止等待 <span>■</span></button></div>
+        </div>
       </form>
+      <p class="model-status" id="model-status" role="status" hidden></p>
       <p class="composer-footnote" id="history-note" role="status">切换会话或刷新页面会重新读取已保存的消息。</p>
     </section>
   </main>

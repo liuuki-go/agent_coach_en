@@ -1,14 +1,8 @@
 
 
-from .template import SYSTEM_PROMPT
 from src.common.third_party_types import AgentGraph
 from langchain_core.runnables import RunnableConfig
 from langchain_core.messages import AIMessage
-
-# ── Initial message list ──
-sys_message = {"role": "system", "content": SYSTEM_PROMPT}
-history_messages = []
-# ── Bind tools to the model ──
 
 def invoke(user_message: dict[str, str], agent: AgentGraph,session_id) -> str:
 
@@ -41,8 +35,6 @@ def invoke(user_message: dict[str, str], agent: AgentGraph,session_id) -> str:
         raise RuntimeError("Agent 没有返回有效的文字回复")
 
 
-
-    return reply
 
     return reply
 

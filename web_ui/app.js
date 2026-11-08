@@ -1,4 +1,4 @@
-import { createSession, getSession, getSessionMessages, listSessions, sendChat } from "./api.js?v=history-2";
+import { createSession, getModelList, getSession, getSessionMessages, listSessions, sendChat } from "./api.js?v=model-list-1";
 
 const $ = (selector) => document.querySelector(selector);
 const input = $("#message-input");
@@ -38,6 +38,54 @@ function showError(text) {
   const alert = $("#chat-error");
   alert.textContent = text;
   alert.hidden = !text;
+}
+
+function closeModelMenu() {
+  $("#model-menu").hidden = true;
+  $("#model-menu-toggle").setAttribute("aria-expanded", "false");
+}
+
+async function loadModelList() {
+  const button = $("#model-menu-toggle");
+  const label = $("#model-label");
+  const status = $("#model-status");
+  button.disabled = true;
+  label.textContent = "正在读取模型…";
+  try {
+    const catalog = await getModelList();
+    const current = catalog.models.find((model) => model.name === catalog.default);
+    label.textContent = current.displayName;
+    const items = catalog.models.map((model) => {
+      const item = document.createElement("li");
+      item.className = "model-item";
+      const description = document.createElement("div");
+      const name = document.createElement("strong");
+      name.textContent = model.displayName;
+      const identifier = document.createElement("span");
+      identifier.textContent = model.name;
+      description.append(name, identifier);
+      item.append(description);
+      if (model.name === catalog.default) {
+        item.classList.add("current");
+        item.setAttribute("aria-current", "true");
+        const check = document.createElement("span");
+        check.className = "model-check";
+        check.textContent = "✓";
+        check.setAttribute("aria-label", "当前默认模型");
+        item.append(check);
+      }
+      return item;
+    });
+    $("#model-list").replaceChildren(...items);
+    button.disabled = false;
+    status.textContent = "";
+    status.hidden = true;
+  } catch (error) {
+    label.textContent = "模型列表不可用";
+    status.textContent = `模型列表读取失败：${error.message} 聊天仍可使用服务端默认模型。`;
+    status.hidden = false;
+    closeModelMenu();
+  }
 }
 
 function savedSessionId() {
@@ -361,9 +409,24 @@ $("#menu-toggle").addEventListener("click", () => {
   $("#menu-toggle").setAttribute("aria-expanded", String(open));
 });
 $("#sidebar-scrim").addEventListener("click", closeSidebar);
+$("#model-menu-toggle").addEventListener("click", () => {
+  const open = $("#model-menu").hidden;
+  $("#model-menu").hidden = !open;
+  $("#model-menu-toggle").setAttribute("aria-expanded", String(open));
+});
+document.addEventListener("pointerdown", (event) => {
+  if (!$("#model-selector").contains(event.target)) closeModelMenu();
+});
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape") closeSidebar();
+  if (event.key === "Escape") {
+    closeSidebar();
+    if (!$("#model-menu").hidden) {
+      closeModelMenu();
+      $("#model-menu-toggle").focus();
+    }
+  }
 });
 
 render();
 export const ready = reloadThreads();
+export const modelsReady = loadModelList();

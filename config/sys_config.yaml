@@ -8,8 +8,14 @@ Data_Base:
   password: Qwe060422.
   database: agent_test
 
-MODEL_CONFIG:
-  model_name: qwen3.5:4b-q4_K_M
-  temperature: 0.0
-  max_tokens: 2048
-  base_url: http://localhost:11434
+model_list:
+  default: qwen3.5:4b-q4_K_M
+  models:
+  - name: qwen3.5:4b-q4_K_M
+    display_name: qwen3.5:4b-q4_K_M
+    base_url: http://localhost:11434
+    temperature: 0.0
+  - name: qwen3.5:9b-q4_K_M
+    display_name: qwen3.5:4b-q4_K_M
+    base_url: http://localhost:11434
+    temperature: 0.0

@@ -17,9 +17,29 @@ Set-Location -LiteralPath 'D:\codes_test\agent_test'
 & 'D:\conda_env\langchain\python.exe' -B 'D:\codes_test\agent_test\web_ui\main.py'
 ```
 
-打开 [http://127.0.0.1:6576](http://127.0.0.1:6576)，终端按 `Ctrl+C` 停止服务。`web_ui/main.py` 复用 `src/service/web_server.py` 的 FastAPI `app`，同一个进程提供页面和 API。PostgreSQL 与 Ollama 仍需独立运行，配置读取自现有 `src/config/sys_config.yaml`。
+打开 [http://127.0.0.1:6576](http://127.0.0.1:6576)，终端按 `Ctrl+C` 停止服务。`web_ui/main.py` 复用 `src/router/web_server.py` 的 FastAPI `app`，同一个进程提供页面和 API。PostgreSQL 与 Ollama 仍需独立运行，配置读取自 `config/sys_config.yaml`。
 
 更新前端后，如果页面仍显示旧提示，先按 `Ctrl+F5` 强制刷新。入口脚本及其 API 模块使用相同的版本参数以区分旧缓存；后续更新脚本时应同步更新两处版本。服务重启不会清除浏览器保存的会话 ID；切换域名或端口会改变浏览器存储范围，但页面仍会从服务端已有会话列表恢复。
+
+## 配置默认模型
+
+模型统一由服务端配置决定，原 `MODEL_CONFIG` 已迁移为：
+
+```yaml
+model_list:
+  default: qwen3.5:4b-q4_K_M
+  models:
+    - name: qwen3.5:4b-q4_K_M
+      display_name: 本地 Qwen3.5 4B
+      base_url: http://127.0.0.1:11434
+      temperature: 0
+```
+
+示例中的 `name` 应替换为已部署在 Ollama 中的模型名称。可以配置多项，`default` 必须精确对应其中一项的 `name`，名称不能重复。`display_name` 可省略，默认显示 `name`；`temperature` 可省略，默认 0。`base_url` 由服务端配置，不返回给浏览器。原先未参与模型构造的 `max_tokens` 项已移除。
+
+启动时会校验并保存配置快照，只创建 `default` 对应的模型。`get_model()` 不接收模型名、服务地址或切换参数；Agent 工厂只接收 checkpointer 和工具。修改列表或默认名称后，重启服务生效。
+
+输入区的模型菜单从后端读取名称列表，标记当前默认项；其他项仅供查看，没有选择或切换操作。前端不保存模型偏好，聊天请求也不携带模型参数。模型列表读取失败会独立提示，不阻塞已有聊天和历史加载。
 
 ## 当前前端行为与能力边界
 
@@ -36,6 +56,7 @@ Set-Location -LiteralPath 'D:\codes_test\agent_test'
 
 | 方法与路径 | 请求 | 当前响应 |
 | --- | --- | --- |
+| `GET /api/models/getModelList` | 无 body | `{ "default": "名称", "models": [{ "name": "名称", "display_name": "显示名" }] }`，为服务启动时的只读模型列表 |
 | `GET /api/sessions/getAllSessions` | 无 body | 会话对象的裸数组 |
 | `POST /api/sessions/createSession` | JSON `{}` | `{ "session_id": 会话对象 }`，状态码 200 |
 | `POST /api/sessions/getSessionById` | `{ "session_id": "UUID" }` | 单个会话对象，不存在时 404 |
@@ -85,14 +106,14 @@ Set-Location -LiteralPath 'D:\codes_test\agent_test'
 node --test web_ui/tests/api.test.js web_ui/tests/ui.test.js
 node --check web_ui/app.js
 node --check web_ui/api.js
-& 'D:\conda_env\langchain\python.exe' -B -m unittest discover -s web_ui/tests -p 'test_*.py' -v
+& 'D:\conda_env\langchain\python.exe' -B -m unittest discover -s src/test -p 'test_*.py' -v
 ```
 
 Node.js 只用于测试。测试夹具验证当前真实 API 的路径、方法与数据结构，并用轻量 DOM 驱动实际 `app.js`，覆盖首次历史加载、会话切换、页面重新打开、无时间消息、重复刷新、空历史、草稿、历史读取失败、回复同步失败、停止等待和文本安全渲染。测试不调用真实数据库或模型，生产页面也不使用测试夹具；测试通过不等于真实持久化和模型联调已经完成。
 
 服务启动后打开 [消息布局回归测试](http://127.0.0.1:6576/tests/layout.test.html)，页面会在 320、390、1280、1920px 四种视口中加载实际前端，检查用户消息靠右且为绿色、AI 消息靠左且为白色，以及长文本、代码块和等待回复时的布局。测试 iframe 隔离 API 和浏览器存储，不读写真实聊天记录或已选会话。
 
-Python 测试覆盖页面入口和实际 FastAPI 的请求、响应协议，包括历史消息过滤、空会话、不存在会话与会话 ID 传递。它同样隔离真实数据库和模型调用。
+Python 测试覆盖实际 FastAPI 的聊天请求、异常与锁行为、模型配置校验、只读列表和启动加载，以及天气工具错误处理。它同样隔离真实数据库、模型和天气 HTTP 调用。
 
 真实联调可在 A 会话发送一段内容，切到 B 确认互不混入，再切回 A、刷新整个页面，确认服务端历史可恢复。随后重启后端再次读取 A；还应验证空会话和查询失败时的提示。当前历史未提供消息时间，页面不应出现虚构的历史时间。
 

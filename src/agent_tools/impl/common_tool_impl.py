@@ -1,12 +1,12 @@
 # 定义常见的工具
 from datetime import datetime
 import json
-from zoneinfo import ZoneInfo
-from config.config_anasize import get_config_value
-import requests
-from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-import json
+
+import requests
+
+from config.config_anasize import get_config_value
+from src.domains.error_domain import tool_error
 
 
 def get_current_time(timezone: str) -> str:
@@ -34,18 +34,26 @@ def get_current_time(timezone: str) -> str:
     )
 
 
-def get_weather(city:str, unit:str="celsius"):
-    #获取天气信息，使用配置文件中的API Key"
-    api_key = get_config_value("GAODE_API_KEY")
-    if not api_key:
-        return "查询失败，请在配置文件中设置高德地图API Key"
+def get_weather(city: str, unit: str = "celsius") -> str:
     city = city.strip()
     if not city:
-        return "查询失败,城市名称不能为空"
+        return tool_error("INVALID_CITY", "城市名称不能为空。")
+
+    api_key = get_config_value("GAODE_API_KEY")
+    if not api_key:
+        return tool_error("WEATHER_CONFIG_ERROR", "天气服务尚未配置，请联系管理员。")
+
     try:
         city_code = resolve_adcode(city, api_key)
-    except ValueError as e:
-        return f"查询失败: {e}"
+    except requests.Timeout:
+        return tool_error("WEATHER_TIMEOUT", "城市查询超时，请稍后重试。")
+    except requests.RequestException:
+        return tool_error("WEATHER_REQUEST_FAILED", "暂时无法连接城市查询服务。")
+    except ValueError:
+        return tool_error("CITY_LOOKUP_FAILED", "未找到唯一城市，请提供更明确的省市名称。")
+    except RuntimeError:
+        return tool_error("CITY_SERVICE_ERROR", "城市查询服务返回异常，请稍后重试。")
+
     try:
         params = {
             "key": api_key,
@@ -58,28 +66,37 @@ def get_weather(city:str, unit:str="celsius"):
             timeout=10,
         )
         response.raise_for_status()
+    except requests.Timeout:
+        return tool_error("WEATHER_TIMEOUT", "天气查询超时，请稍后重试。")
     except requests.RequestException:
-        return "查询失败，请检查网络连接或高德地图API Key是否有效"
-    data = response.json()
-    if data.get("status") != "1":   
-        return f"查询失败：{data.get('info')}，错误码：{data.get('infocode')}"
+        return tool_error("WEATHER_REQUEST_FAILED", "暂时无法连接天气服务。")
+
+    try:
+        data = response.json()
+    except ValueError:
+        return tool_error("WEATHER_RESPONSE_INVALID", "天气服务返回的数据格式无效。")
+
+    if not isinstance(data, dict) or data.get("status") not in ("0", "1"):
+        return tool_error("WEATHER_RESPONSE_INVALID", "天气服务返回的数据格式无效。")
+    if data["status"] != "1":
+        return tool_error("WEATHER_SERVICE_ERROR", "天气服务暂时无法完成查询，请稍后重试。")
+
     lives = data.get("lives", [])
-    forecasts = data.get("forecasts",[])
-    return json.dumps({
-        "lives": lives,
-        "forecasts": forecasts
-    },ensure_ascii=False
+    forecasts = data.get("forecasts", [])
+    if (
+        not ("lives" in data or "forecasts" in data)
+        or not isinstance(lives, list)
+        or not isinstance(forecasts, list)
+        or not all(isinstance(item, dict) for item in lives + forecasts)
+    ):
+        return tool_error("WEATHER_RESPONSE_INVALID", "天气服务返回的数据格式无效。")
+
+    return json.dumps(
+        {"lives": lives, "forecasts": forecasts}, ensure_ascii=False
     )
-    
-    
 
-        
-'''
-根据关键词获取城市的adcode，使用高德地图API
-'''
+
 def resolve_adcode(city: str, api_key: str) -> str:
-    #获取城市poi信息
-
     params = {
         "key": api_key,
         "keywords": city,
@@ -87,32 +104,33 @@ def resolve_adcode(city: str, api_key: str) -> str:
         "extensions": "base",
         "output": "JSON",
     }
+    response = requests.get(
+        "https://restapi.amap.com/v3/config/district",
+        params=params,
+        timeout=10,
+    )
+    response.raise_for_status()
     try:
-        response = requests.get(
-            "https://restapi.amap.com/v3/config/district",
-            params=params,
-            timeout=10,
-        )
-        response.raise_for_status()
-    except requests.RequestException:
-        raise RuntimeError("高德请求失败或超时") 
-    data = response.json()
-    if data.get("status") != "1":
-        raise RuntimeError(
-            f"高德查询失败：{data.get('info')}，错误码：{data.get('infocode')}"
-        )
+        data = response.json()
+    except ValueError:
+        raise RuntimeError("城市查询响应不是有效 JSON") from None
 
-    districts = data.get("districts", [])
+    if not isinstance(data, dict) or data.get("status") != "1":
+        raise RuntimeError("城市查询服务响应异常")
 
-    matches = [district for district in districts ]
+    districts = data.get("districts")
+    if not isinstance(districts, list) or not all(
+        isinstance(district, dict) for district in districts
+    ):
+        raise RuntimeError("城市查询结果格式无效")
 
-    if not matches:
+    if not districts:
         raise ValueError("未找到精确匹配的地区，请确认中文名称")
 
-    if len(matches) > 1:
+    if len(districts) > 1:
         raise ValueError("存在同名地区，需要进一步限定省份")
 
-    adcode = matches[0].get("adcode")
-    if not adcode:
+    adcode = districts[0].get("adcode")
+    if not isinstance(adcode, str) or not adcode.strip():
         raise RuntimeError("高德结果中缺少 adcode")
-    return adcode
+    return adcode.strip()

@@ -6,8 +6,8 @@ from langgraph.checkpoint.postgres import PostgresSaver
 
 from src.common.dababase_pool import create_db_pool
 from src.agents.english_teacher.agent_factory import build_agent
+from src.agents.english_teacher.model_factory import get_model_list
 from src.common.session_store import SessionStore
-from config.config_anasize import get_config_value
 from uuid import UUID
 from src.common.third_party_types import AgentGraph
 from typing import Literal
@@ -17,7 +17,7 @@ from langchain_core.runnables import RunnableConfig
 
 from src.domains.session_domain import SessionMessageResponse
 from src.agent_tools.common_tool import common_tools
-from common.agent_lock import SessionLocks
+from src.common.agent_lock import SessionLocks
 import logging
 
 import httpx
@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    model_list = get_model_list()
     pool = create_db_pool()
 
     try:
@@ -37,25 +38,11 @@ async def lifespan(app: FastAPI):
 
         session_store = SessionStore(pool)
         session_store.setup()
-        #加载配置，以便加载默认模型
-        model_config = get_config_value("MODEL_CONFIG", {})
-        if (
-            not isinstance(model_config, dict)
-            or not model_config.get("model_name")
-            or not model_config.get("base_url")
-        ):
-            raise ValueError(
-                "MODEL_CONFIG 需要配置 model_name 和 base_url"
-            )
-
         print("数据库连接池和 checkpointer 已就绪")
         # 创建默认的agent 实例 
         agent = build_agent(
             checkpointer=checkpointer,
             tools=common_tools, 
-            model_name=model_config["model_name"],
-            base_url=model_config["base_url"],
-            temperature=model_config.get("temperature", 0),
         )
         print("agent 实例已创建")
 
@@ -64,6 +51,7 @@ async def lifespan(app: FastAPI):
         app.state.db_pool = pool
         app.state.checkpointer = checkpointer
         app.state.agent = agent
+        app.state.model_list = model_list
         app.state.session_store = session_store
         app.state.session_locks = SessionLocks()
         yield
@@ -87,9 +75,17 @@ from src.domains.chat_domain import UserMessage
 def health():
     return {"status": "ok"}
 
+
+@app.get("/api/models/getModelList")
+def get_models():
+    return app.state.model_list
+
 #执行聊天
 @app.post("/api/chat")
 def chat(request: UserMessage):
+    if not valid_chat_request(request):
+        raise HTTPException(status_code=400, detail="请求参数无效")
+
     # 检查会话存在，不存在则报错结束本次业务
     session_store: SessionStore = app.state.session_store
     if session_store.get_session(request.session_id) is None:
@@ -104,16 +100,6 @@ def chat(request: UserMessage):
         )
 
     try:
-        # 在这里执行：
-        # 会话存在检查 → Agent 调用及异常处理 → 更新时间 → 返回回复
-        
-    
-        valid = valid_chat_request(request)
-        if not valid:
-            raise HTTPException(status_code=400, detail="请求参数无效")
-    
-    
-    
         agent: AgentGraph = app.state.agent
         user_message = {
             "role": "user",
@@ -126,14 +112,6 @@ def chat(request: UserMessage):
                 agent=agent,
                 session_id=request.session_id,
             )
-            #更新会话时间
-            updated = session_store.touch_session(request.session_id)
-            if not updated:
-                logger.warning(
-                    "session_touch_missing session_id=%s",
-                    request.session_id,
-                )
-    
         except httpx.TimeoutException:
             raise HTTPException(
                 status_code=504,
@@ -159,7 +137,22 @@ def chat(request: UserMessage):
                 status_code=500,
                 detail="聊天处理失败，请稍后查询历史确认结果",
             ) from None
-    
+
+        # 回复已成功生成，更新时间失败不改变本轮聊天结果。
+        try:
+            updated = session_store.touch_session(request.session_id)
+            if not updated:
+                logger.warning(
+                    "session_touch_missing session_id=%s",
+                    request.session_id,
+                )
+        except Exception as exc:
+            logger.error(
+                "session_touch_failed session_id=%s error_type=%s",
+                request.session_id,
+                type(exc).__name__,
+            )
+
         return reply
 
     finally:

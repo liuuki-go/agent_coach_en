@@ -11,17 +11,8 @@ from .model_factory import get_model
 def build_agent(
     checkpointer: CheckpointSaver | None,
     tools: Sequence[ToolDefinition],
-    model_name: str,
-    base_url: str,
-    temperature: float,
-    switch_model: bool = False,
 ) -> AgentGraph:
-    model = get_model(
-        model_name,
-        base_url,
-        temperature,
-        switch_model,
-    )
+    model = get_model()
 
     return create_agent(
         model=model,

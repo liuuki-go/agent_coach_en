@@ -28,6 +28,13 @@ const fixtureScript = `<script>
     getItem() { return null; }, setItem() {}
   } });
   window.fetch = async (url) => {
+    if (url === "/api/models/getModelList") return Response.json({
+      default: "layout-default",
+      models: [
+        { name: "layout-other", display_name: "其他模型" },
+        { name: "layout-default", display_name: "布局默认模型" }
+      ]
+    });
     if (url === "/api/sessions/getAllSessions") return Response.json([session]);
     if (url === "/api/sessions/getSessionById") return Response.json(session);
     if (url === "/api/sessions/getSessionMessages") return Response.json(${JSON.stringify(messages)});
@@ -80,15 +87,28 @@ for (const width of [320, 390, 1280, 1920]) {
   document.body.append(frame);
   try {
     await waitFor(() => frame.contentDocument.querySelectorAll(".message").length === messages.length
-      && !frame.contentDocument.querySelector("#message-input").disabled);
+      && !frame.contentDocument.querySelector("#message-input").disabled
+      && !frame.contentDocument.querySelector("#model-menu-toggle").disabled);
     checkMessages(frame.contentWindow);
+    const doc = frame.contentDocument;
+    const modelToggle = doc.querySelector("#model-menu-toggle");
+    assert(doc.querySelector("#model-label").textContent === "布局默认模型", "未显示配置默认模型");
+    modelToggle.click();
+    const modelMenu = doc.querySelector("#model-menu");
+    assert(!modelMenu.hidden, "模型菜单未展开");
+    const menuBounds = modelMenu.getBoundingClientRect();
+    assert(menuBounds.left >= -1 && menuBounds.right <= width + 1, "模型菜单横向溢出视口");
+    doc.querySelector("#model-list li").click();
+    assert(doc.querySelector("#model-label").textContent === "布局默认模型", "只读模型列表改变了当前模型");
+    doc.dispatchEvent(new frame.contentWindow.KeyboardEvent("keydown", { key: "Escape" }));
+    assert(modelMenu.hidden, "Escape未关闭模型菜单");
     const input = frame.contentDocument.querySelector("#message-input");
     input.value = "等待回复时也要保持左右布局";
     input.dispatchEvent(new frame.contentWindow.Event("input"));
     frame.contentDocument.querySelector("#chat-form").requestSubmit();
     await waitFor(() => frame.contentDocument.querySelector(".typing"));
     checkMessages(frame.contentWindow);
-    results.textContent += `PASS ${width}px：长短消息、多行、长链接、代码块和等待回复的左右位置、颜色与溢出检查\n`;
+    results.textContent += `PASS ${width}px：消息气泡、长内容、等待回复及只读模型菜单的布局与溢出检查\n`;
   } catch (error) {
     failures++;
     results.textContent += `FAIL ${width}px：${error.message}\n`;

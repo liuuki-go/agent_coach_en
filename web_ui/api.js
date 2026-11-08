@@ -3,6 +3,7 @@ export const SESSION_LIST_ENDPOINT = "/api/sessions/getAllSessions";
 export const SESSION_DETAIL_ENDPOINT = "/api/sessions/getSessionById";
 export const SESSION_CREATE_ENDPOINT = "/api/sessions/createSession";
 export const SESSION_MESSAGES_ENDPOINT = "/api/sessions/getSessionMessages";
+export const MODEL_LIST_ENDPOINT = "/api/models/getModelList";
 
 export class ChatApiError extends Error {
   constructor(message, status = 0) {
@@ -75,6 +76,26 @@ export async function listSessions(options = {}) {
   const data = await requestJson(SESSION_LIST_ENDPOINT, options);
   if (!Array.isArray(data)) throw new ChatApiError("接口没有返回有效的会话列表。");
   return data.map(parseSession);
+}
+
+export async function getModelList(options = {}) {
+  const data = await requestJson(MODEL_LIST_ENDPOINT, { ...options, method: "GET", body: undefined });
+  if (typeof data?.default !== "string" || !data.default.trim()
+    || !Array.isArray(data.models) || data.models.length === 0) {
+    throw new ChatApiError("接口没有返回有效的模型列表。");
+  }
+  const names = new Set();
+  const models = data.models.map((model) => {
+    if (typeof model?.name !== "string" || !model.name.trim()
+      || typeof model.display_name !== "string" || !model.display_name.trim()
+      || names.has(model.name)) {
+      throw new ChatApiError("接口返回的模型信息无效。");
+    }
+    names.add(model.name);
+    return { name: model.name, displayName: model.display_name };
+  });
+  if (!names.has(data.default)) throw new ChatApiError("默认模型不在配置列表中。");
+  return { default: data.default, models };
 }
 
 export async function createSession(options = {}) {
