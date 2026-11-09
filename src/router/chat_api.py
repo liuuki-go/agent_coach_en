@@ -1,5 +1,4 @@
 from fastapi import FastAPI, HTTPException
-from src.agents.english_teacher.model_main import invoke
 from contextlib import asynccontextmanager
 
 from langgraph.checkpoint.postgres import PostgresSaver
@@ -19,11 +18,22 @@ from src.domains.session_domain import SessionMessageResponse
 from src.agent_tools.common_tool import common_tools
 from src.common.agent_lock import SessionLocks
 import logging
+from src.service.chat_service import send_message
+from src.domains.error_domain import ChatError
+from src.domains.session_domain import GetSessionByIdRequest
 
-import httpx
-from ollama import ResponseError
 
 logger = logging.getLogger(__name__)
+
+# HTTP 状态属于接口协议，服务层只返回业务错误码。
+_CHAT_ERROR_STATUS = {
+    "SESSION_NOT_FOUND": 404,
+    "SESSION_BUSY": 409,
+    "MODEL_TIMEOUT": 504,
+    "MODEL_UNAVAILABLE": 503,
+    "MODEL_RESPONSE_ERROR": 502,
+    "CHAT_FAILED": 500,
+}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -82,88 +92,25 @@ def get_models():
 
 #执行聊天
 @app.post("/api/chat")
-def chat(request: UserMessage):
+def chat(request: UserMessage) -> str:
     if not valid_chat_request(request):
         raise HTTPException(status_code=400, detail="请求参数无效")
-
-    # 检查会话存在，不存在则报错结束本次业务
-    session_store: SessionStore = app.state.session_store
-    if session_store.get_session(request.session_id) is None:
-        raise HTTPException(status_code=404, detail="会话不存在")
-    
-    lock = app.state.session_locks.get(request.session_id)
-
-    if not lock.acquire(blocking=False):
-        raise HTTPException(
-            status_code=409,
-            detail="当前会话正在处理消息，请等待完成",
-        )
-
     try:
-        agent: AgentGraph = app.state.agent
-        user_message = {
-            "role": "user",
-            "content": request.content,
-        }
-    
-        try:
-            reply = invoke(
-                user_message=user_message,
-                agent=agent,
-                session_id=request.session_id,
-            )
-        except httpx.TimeoutException:
-            raise HTTPException(
-                status_code=504,
-                detail="模型响应超时，请稍后查询历史确认结果",
-            ) from None
-        except (httpx.RequestError, ConnectionError):
-            raise HTTPException(
-                status_code=503,
-                detail="暂时无法连接模型服务",
-            ) from None
-        except ResponseError:
-            raise HTTPException(
-                status_code=502,
-                detail="模型服务返回异常",
-            ) from None
-        except Exception as exc:
-            logger.error(
-                "chat_failed session_id=%s error_type=%s",
-                request.session_id,
-                type(exc).__name__,
-            )
-            raise HTTPException(
-                status_code=500,
-                detail="聊天处理失败，请稍后查询历史确认结果",
-            ) from None
+        # 在接口边界取出共享资源，服务函数无需了解 app.state。
+        return send_message(
+            session_id=request.session_id,
+            content=request.content,
+            agent=app.state.agent,
+            session_store=app.state.session_store,
+            session_locks=app.state.session_locks,
+        )
+    except ChatError as exc:
+        raise HTTPException(
+            status_code=_CHAT_ERROR_STATUS.get(exc.code, 500),
+            detail=exc.message,
+        ) from None
+   
 
-        # 回复已成功生成，更新时间失败不改变本轮聊天结果。
-        try:
-            updated = session_store.touch_session(request.session_id)
-            if not updated:
-                logger.warning(
-                    "session_touch_missing session_id=%s",
-                    request.session_id,
-                )
-        except Exception as exc:
-            logger.error(
-                "session_touch_failed session_id=%s error_type=%s",
-                request.session_id,
-                type(exc).__name__,
-            )
-
-        return reply
-
-    finally:
-        lock.release()
-
-
-
- 
-
-
-from src.domains.session_domain import GetSessionByIdRequest
 @app.get("/api/sessions/getAllSessions")
 def get_all_sessions():
     "获取所有会话"
@@ -189,6 +136,7 @@ def create_session():
     new_session_id = session_store.create_session()
     return {"session_id": new_session_id}
 
+
 @app.post("/api/sessions/getSessionMessages")
 def get_session_messages(
     request: GetSessionByIdRequest,
@@ -207,9 +155,9 @@ def get_session_messages(
 
     snapshot = agent.get_state(config)
     saved_messages = snapshot.values.get("messages", [])
-
+    
+    # 组装response 
     result: list[SessionMessageResponse] = []
-
     for message in saved_messages:
         role: Literal["user", "assistant"]
 

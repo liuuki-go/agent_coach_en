@@ -62,6 +62,9 @@ function server(initial = []) {
     onChat: null,
     onHistory: null,
     onModels: null,
+    onList: null,
+    onSession: null,
+    onCreate: null,
     modelCatalog: {
       default: "model-b",
       models: [
@@ -78,10 +81,12 @@ function server(initial = []) {
       return Response.json(state.modelCatalog);
     }
     if (url === "/api/sessions/getAllSessions" && options.method === "GET") {
+      if (state.onList) return state.onList(options);
       return Response.json(state.sessions);
     }
     if (url === "/api/sessions/createSession" && options.method === "POST") {
       assert.deepEqual(body, {});
+      if (state.onCreate) return state.onCreate(options);
       const next = session([A, B, C].find((id) => !state.details.has(id)), "新的英语时光");
       state.sessions.unshift(next);
       state.details.set(next.id, next);
@@ -89,6 +94,7 @@ function server(initial = []) {
       return Response.json({ session_id: next });
     }
     if (url === "/api/sessions/getSessionById" && options.method === "POST") {
+      if (state.onSession) return state.onSession(body, options);
       const found = state.details.get(body.session_id);
       return found ? Response.json(found) : Response.json({ detail: "会话不存在" }, { status: 404 });
     }
@@ -110,7 +116,7 @@ function server(initial = []) {
   return state;
 }
 
-async function openApp(t, state, storage = new Map(), { waitForModels = true } = {}) {
+async function openApp(t, state, storage = new Map(), { waitForModels = true, waitForReady = true } = {}) {
   const elements = new Map();
   const listeners = new Map();
   const document = {
@@ -143,9 +149,9 @@ async function openApp(t, state, storage = new Map(), { waitForModels = true } =
   });
   t.after(() => Object.assign(globalThis, previous));
   const app = await import(`../app.js?ui-test=${++importNumber}`);
-  await app.ready;
+  if (waitForReady) await app.ready;
   if (waitForModels) await app.modelsReady;
-  return { get, storage, document, modelsReady: app.modelsReady };
+  return { get, storage, document, ready: app.ready, modelsReady: app.modelsReady };
 }
 
 function threadButton(ui, title) {
@@ -158,6 +164,62 @@ function chatCalls(state) {
 
 function descendants(element) {
   return [element, ...element.children.flatMap(descendants)];
+}
+
+function deadlineClock(t) {
+  const previous = { setTimeout: globalThis.setTimeout, clearTimeout: globalThis.clearTimeout };
+  const timers = new Map();
+  globalThis.setTimeout = (callback, delay, ...args) => {
+    if (delay !== 10000 && delay !== 120000) return previous.setTimeout(callback, delay, ...args);
+    const handle = {};
+    timers.set(handle, { callback, delay, args });
+    return handle;
+  };
+  globalThis.clearTimeout = (handle) => {
+    if (!timers.delete(handle)) previous.clearTimeout(handle);
+  };
+  t.after(() => {
+    timers.clear();
+    Object.assign(globalThis, previous);
+  });
+  return {
+    expire(delay) {
+      const due = [...timers].filter(([, timer]) => timer.delay === delay);
+      assert.equal(due.length, 1, `应恰有一个等待中的 ${delay}ms 请求`);
+      for (const [handle, timer] of due) {
+        timers.delete(handle);
+        timer.callback(...timer.args);
+      }
+    },
+  };
+}
+
+function waitForAbort(options) {
+  return new Promise((_resolve, reject) => {
+    const abort = () => reject(new DOMException("Aborted", "AbortError"));
+    if (options.signal.aborted) abort();
+    else options.signal.addEventListener("abort", abort, { once: true });
+  });
+}
+
+function stalledRequest() {
+  let markStarted;
+  const started = new Promise((resolve) => { markStarted = resolve; });
+  return {
+    started,
+    handle(options) {
+      markStarted();
+      return waitForAbort(options);
+    },
+  };
+}
+
+function assertReady(ui) {
+  assert.equal(ui.get("#message-input").disabled, false);
+  assert.equal(ui.get("#new-chat").disabled, false);
+  assert.equal(ui.get("#reload-history").disabled, false);
+  assert.equal(ui.get("#stop-button").hidden, true);
+  assert.equal(ui.get("#message-list").attributes.get("aria-busy"), "false");
 }
 
 test("模型菜单展示服务端默认项和全部安全文字，其他项不可切换且聊天请求不变", async (t) => {
@@ -601,4 +663,222 @@ test("模型HTML只作为文本显示，reply不会成为可执行DOM", async (t
   const visit = (node) => { nodes.push(node); node.children?.forEach(visit); };
   visit(ui.get("#message-list"));
   assert.equal(nodes.some((node) => node.name === "img" && node.src === "x"), false);
+});
+
+test("首次会话列表超时后可以刷新，不把未知结果当空列表创建会话", async (t) => {
+  const clock = deadlineClock(t);
+  const state = server([session(A, "已有会话")]);
+  const stalled = stalledRequest();
+  state.onList = stalled.handle;
+  const ui = await openApp(t, state, new Map(), { waitForReady: false });
+  await stalled.started;
+  assert.equal(ui.get("#reload-history").disabled, true);
+  clock.expire(10000);
+  await ui.ready;
+  assert.match(ui.get("#chat-error").textContent, /超时/);
+  assert.equal(ui.get("#reload-history").disabled, false);
+  assert.equal(ui.get("#new-chat").disabled, false);
+  assert.equal(ui.get("#message-input").disabled, true);
+  assert.equal(state.calls.filter((call) => call.url === "/api/sessions/createSession").length, 0);
+  state.onList = null;
+  await ui.get("#reload-history").emit("click");
+  assert.equal(ui.storage.get("teresa.activeSessionId"), A);
+  assertReady(ui);
+  assert.equal(state.calls.filter((call) => call.url === "/api/sessions/createSession").length, 0);
+});
+
+for (const phase of ["metadata", "history"]) {
+  test(`切换会话${phase === "metadata" ? "元数据" : "历史"}超时后保留原会话和草稿`, async (t) => {
+    const clock = deadlineClock(t);
+    const state = server([session(A, "A会话"), session(B, "B会话")]);
+    state.histories.set(A, [{ role: "assistant", content: "A原有历史" }]);
+    state.histories.set(B, [{ role: "assistant", content: "B目标历史" }]);
+    const ui = await openApp(t, state, new Map([["teresa.activeSessionId", A]]));
+    ui.get("#message-input").value = "A未发送的草稿";
+    const stalled = stalledRequest();
+    if (phase === "metadata") state.onSession = (_body, options) => stalled.handle(options);
+    else state.onHistory = (_body, options) => stalled.handle(options);
+    const selecting = threadButton(ui, "B会话").emit("click");
+    await stalled.started;
+    assert.equal(ui.get("#message-input").disabled, true);
+    clock.expire(10000);
+    await selecting;
+    assert.equal(ui.storage.get("teresa.activeSessionId"), A);
+    assert.equal(ui.get("#message-input").value, "A未发送的草稿");
+    assert.match(ui.get("#message-list").textContent, /A原有历史/);
+    assert.doesNotMatch(ui.get("#message-list").textContent, /B目标历史/);
+    assert.match(ui.get("#chat-error").textContent, /超时/);
+    assertReady(ui);
+    state.onSession = null;
+    state.onHistory = null;
+    await threadButton(ui, "B会话").emit("click");
+    assert.match(ui.get("#message-list").textContent, /B目标历史/);
+    await threadButton(ui, "A会话").emit("click");
+    assert.equal(ui.get("#message-input").value, "A未发送的草稿");
+    assert.equal(chatCalls(state).length, 0);
+  });
+}
+
+test("刷新历史超时后保留已有历史和草稿并允许再次刷新", async (t) => {
+  const clock = deadlineClock(t);
+  const state = server([session(A, "英语练习")]);
+  state.histories.set(A, [{ role: "assistant", content: "已保存的回复" }]);
+  const ui = await openApp(t, state);
+  ui.get("#message-input").value = "不应丢失的草稿";
+  const stalled = stalledRequest();
+  state.onHistory = (_body, options) => stalled.handle(options);
+  const refreshing = ui.get("#reload-history").emit("click");
+  await stalled.started;
+  clock.expire(10000);
+  await refreshing;
+  assert.match(ui.get("#message-list").textContent, /已保存的回复/);
+  assert.equal(ui.get("#message-list").children.length, 1);
+  assert.equal(ui.get("#message-input").value, "不应丢失的草稿");
+  assert.match(ui.get("#chat-error").textContent, /超时/);
+  assertReady(ui);
+  state.onHistory = null;
+  await ui.get("#reload-history").emit("click");
+  assert.equal(ui.get("#message-list").children.length, 1);
+  assert.equal(ui.get("#message-input").value, "不应丢失的草稿");
+  assert.equal(chatCalls(state).length, 0);
+});
+
+test("成功回复后的历史同步超时保留回复并解除忙碌，不恢复草稿或重发聊天", async (t) => {
+  const clock = deadlineClock(t);
+  const state = server([session(A, "英语练习")]);
+  const ui = await openApp(t, state);
+  const stalled = stalledRequest();
+  state.onHistory = (_body, options) => stalled.handle(options);
+  ui.get("#message-input").value = "已经成功的问题";
+  const submitting = ui.get("#chat-form").emit("submit");
+  await stalled.started;
+  assert.match(ui.get("#message-list").textContent, /Hello!/);
+  assert.equal(ui.get("#message-input").disabled, true);
+  assert.equal(ui.get("#stop-button").hidden, true);
+  clock.expire(10000);
+  await submitting;
+  assert.equal(ui.get("#message-list").children.length, 2);
+  assert.match(ui.get("#message-list").textContent, /已经成功的问题/);
+  assert.match(ui.get("#message-list").textContent, /Hello!/);
+  assert.match(ui.get("#chat-error").textContent, /回复已收到，但历史同步失败/);
+  assert.match(ui.get("#chat-error").textContent, /超时/);
+  assert.equal(ui.get("#message-input").value, "");
+  assert.equal(chatCalls(state).length, 1);
+  assertReady(ui);
+  state.onHistory = null;
+  await ui.get("#reload-history").emit("click");
+  assert.equal(ui.get("#message-list").children.length, 2);
+  assert.equal(chatCalls(state).length, 1);
+});
+
+test("新建会话超时保留原会话和草稿，刷新可以确认后台已创建的会话", async (t) => {
+  const clock = deadlineClock(t);
+  const state = server([session(A, "原会话")]);
+  state.histories.set(A, [{ role: "assistant", content: "原会话历史" }]);
+  const ui = await openApp(t, state);
+  ui.get("#message-input").value = "原会话草稿";
+  const stalled = stalledRequest();
+  state.onCreate = (options) => {
+    const created = session(B, "后台已创建的会话");
+    state.sessions.unshift(created);
+    state.details.set(B, created);
+    state.histories.set(B, []);
+    return stalled.handle(options);
+  };
+  const creating = ui.get("#new-chat").emit("click");
+  await stalled.started;
+  clock.expire(10000);
+  await creating;
+  assert.equal(ui.storage.get("teresa.activeSessionId"), A);
+  assert.equal(ui.get("#message-input").value, "原会话草稿");
+  assert.match(ui.get("#message-list").textContent, /原会话历史/);
+  assert.match(ui.get("#chat-error").textContent, /可能.*创建/);
+  assert.match(ui.get("#chat-error").textContent, /刷新.*确认/);
+  assertReady(ui);
+  state.onCreate = null;
+  await ui.get("#reload-history").emit("click");
+  assert.ok(threadButton(ui, "后台已创建的会话"));
+  assert.equal(ui.storage.get("teresa.activeSessionId"), A);
+  assert.equal(ui.get("#message-input").value, "原会话草稿");
+  assert.equal(state.calls.filter((call) => call.url === "/api/sessions/createSession").length, 1);
+});
+
+test("首次自动创建超时后刷新空列表不再次自动创建，后台会话出现后可以恢复", async (t) => {
+  const clock = deadlineClock(t);
+  const state = server();
+  const stalled = stalledRequest();
+  state.onCreate = stalled.handle;
+  const ui = await openApp(t, state, new Map(), { waitForReady: false });
+  await stalled.started;
+  clock.expire(10000);
+  await ui.ready;
+  assert.match(ui.get("#chat-error").textContent, /可能.*创建/);
+  assert.equal(ui.get("#reload-history").disabled, false);
+  assert.equal(ui.get("#message-input").disabled, true);
+  assert.equal(state.calls.filter((call) => call.url === "/api/sessions/createSession").length, 1);
+  state.onCreate = null;
+  await ui.get("#reload-history").emit("click");
+  assert.equal(state.calls.filter((call) => call.url === "/api/sessions/createSession").length, 1);
+  assert.equal(ui.get("#message-input").disabled, true);
+  assert.match(ui.get("#chat-error").textContent, /创建|确认/);
+  const created = session(A, "后台确认的会话");
+  state.sessions.push(created);
+  state.details.set(A, created);
+  state.histories.set(A, []);
+  await ui.get("#reload-history").emit("click");
+  assert.equal(ui.storage.get("teresa.activeSessionId"), A);
+  assert.equal(state.calls.filter((call) => call.url === "/api/sessions/createSession").length, 1);
+  assertReady(ui);
+});
+
+test("模型列表超时独立提示，等待期间和超时后均可继续聊天", async (t) => {
+  const clock = deadlineClock(t);
+  const state = server([session(A, "英语练习")]);
+  const stalled = stalledRequest();
+  state.onModels = stalled.handle;
+  const ui = await openApp(t, state, new Map(), { waitForModels: false });
+  await stalled.started;
+  assert.equal(ui.get("#model-label").textContent, "正在读取模型…");
+  assertReady(ui);
+  ui.get("#message-input").value = "模型列表等待期间的问题";
+  await ui.get("#chat-form").emit("submit");
+  assert.match(ui.get("#message-list").textContent, /Hello!/);
+  clock.expire(10000);
+  await ui.modelsReady;
+  assert.equal(ui.get("#model-label").textContent, "模型列表不可用");
+  assert.equal(ui.get("#model-menu-toggle").disabled, true);
+  assert.match(ui.get("#model-status").textContent, /超时/);
+  assert.equal(ui.get("#chat-error").hidden, true);
+  assertReady(ui);
+  ui.get("#message-input").value = "模型列表超时后的问题";
+  await ui.get("#chat-form").emit("submit");
+  assert.equal(chatCalls(state).length, 2);
+  assert.equal(ui.get("#message-list").children.length, 4);
+  assert.equal(ui.get("#model-status").hidden, false);
+});
+
+test("聊天响应头到达后body挂起仍按聊天超时恢复草稿，不能误报无效JSON", async (t) => {
+  const clock = deadlineClock(t);
+  const state = server([session(A, "英语练习")]);
+  const stalled = stalledRequest();
+  state.onChat = (_body, options) => ({
+    ok: true,
+    status: 200,
+    json: () => stalled.handle(options),
+  });
+  const ui = await openApp(t, state);
+  ui.get("#message-input").value = "body未完成的问题";
+  const submitting = ui.get("#chat-form").emit("submit");
+  await stalled.started;
+  assert.equal(ui.get("#stop-button").hidden, false);
+  clock.expire(120000);
+  await submitting;
+  assert.equal(ui.get("#message-input").value, "body未完成的问题");
+  assert.equal(ui.get("#message-list").children.length, 0);
+  assert.match(ui.get("#chat-error").textContent, /等待超过两分钟/);
+  assert.match(ui.get("#chat-error").textContent, /后端可能仍在处理/);
+  assert.match(ui.get("#chat-error").textContent, /重新发送可能重复执行/);
+  assert.doesNotMatch(ui.get("#chat-error").textContent, /无效.*JSON/);
+  assert.equal(chatCalls(state).length, 1);
+  assertReady(ui);
 });

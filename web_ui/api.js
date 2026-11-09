@@ -6,10 +6,11 @@ export const SESSION_MESSAGES_ENDPOINT = "/api/sessions/getSessionMessages";
 export const MODEL_LIST_ENDPOINT = "/api/models/getModelList";
 
 export class ChatApiError extends Error {
-  constructor(message, status = 0) {
+  constructor(message, status = 0, code = "REQUEST_FAILED") {
     super(message);
     this.name = "ChatApiError";
     this.status = status;
+    this.code = code;
   }
 }
 
@@ -42,34 +43,84 @@ function parseSession(session) {
   };
 }
 
-async function requestJson(url, { method = "GET", body, signal, fetchImpl = globalThis.fetch } = {}) {
-  let response;
-  try {
-    response = await fetchImpl(url, {
-      method,
-      headers: { "Content-Type": "application/json", Accept: "application/json" },
-      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-      signal,
-    });
-  } catch (error) {
-    if (signal?.aborted || error.name === "AbortError") throw error;
-    throw new ChatApiError("无法连接后端。请确认 Web UI 启动服务仍在运行。");
-  }
+function abortedError() {
+  const error = new ChatApiError("已停止等待。", 0, "ABORTED");
+  error.name = "AbortError";
+  return error;
+}
 
-  let data;
+async function requestJson(url, {
+  method = "GET", body, signal, fetchImpl = globalThis.fetch, timeoutMs = 10_000,
+} = {}) {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new ChatApiError("请求超时时间必须是有限正数。");
+  }
+  if (signal?.aborted) throw abortedError();
+
+  const controller = new AbortController();
+  let finished = false;
+  let stopError;
+  let rejectStopped;
+  const stopped = new Promise((_resolve, reject) => { rejectStopped = reject; });
+  const stop = (error) => {
+    if (finished) return;
+    finished = true;
+    stopError = error;
+    rejectStopped(error);
+    // 取消本地等待并中止 fetch，不代表后端已停止生成或写入历史。
+    controller.abort();
+  };
+  const onAbort = () => stop(abortedError());
+  signal?.addEventListener("abort", onAbort, { once: true });
+  // 同一个 deadline 覆盖响应头和 JSON 读取，不在收到响应头后重新计时。
+  const timer = setTimeout(() => stop(new ChatApiError("请求等待超时。", 0, "TIMEOUT")), timeoutMs);
+
+  const readResponse = async () => {
+    let response;
+    try {
+      response = await fetchImpl(url, {
+        method,
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+        signal: controller.signal,
+      });
+    } catch (error) {
+      if (stopError) throw stopError;
+      finished = true;
+      if (error?.name === "AbortError") throw abortedError();
+      throw new ChatApiError("无法连接后端。请确认 Web UI 启动服务仍在运行。", 0, "NETWORK_ERROR");
+    }
+    if (stopError) throw stopError;
+
+    let data;
+    try {
+      data = await response.json();
+    } catch (error) {
+      if (stopError) throw stopError;
+      finished = true;
+      if (error?.name === "AbortError") throw abortedError();
+      throw new ChatApiError(`接口返回了无效 JSON（HTTP ${response.status}）。`, response.status, "INVALID_JSON");
+    }
+    if (stopError) throw stopError;
+    finished = true;
+    if (!response.ok) {
+      const detail = typeof data?.detail === "string" ? data.detail : data?.error;
+      throw new ChatApiError(
+        typeof detail === "string" ? detail : `请求失败（HTTP ${response.status}）。`,
+        response.status,
+      );
+    }
+    return data;
+  };
+
   try {
-    data = await response.json();
-  } catch {
-    throw new ChatApiError(`接口返回了无效 JSON（HTTP ${response.status}）。`, response.status);
+    // 即使 adapter 或 JSON promise 不响应 abort，也要结束本地等待。
+    return await Promise.race([readResponse(), stopped]);
+  } finally {
+    finished = true;
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", onAbort);
   }
-  if (!response.ok) {
-    const detail = typeof data?.detail === "string" ? data.detail : data?.error;
-    throw new ChatApiError(
-      typeof detail === "string" ? detail : `请求失败（HTTP ${response.status}）。`,
-      response.status,
-    );
-  }
-  return data;
 }
 
 export async function listSessions(options = {}) {
@@ -137,7 +188,8 @@ export function buildChatRequest(sessionId, content) {
 
 export async function sendChat(sessionId, content, options = {}) {
   const body = buildChatRequest(sessionId, content);
-  const data = await requestJson(CHAT_ENDPOINT, { ...options, method: "POST", body });
+  const { timeoutMs = 120_000 } = options;
+  const data = await requestJson(CHAT_ENDPOINT, { ...options, timeoutMs, method: "POST", body });
   const reply = typeof data === "string" ? data : data?.reply;
   if (typeof reply !== "string" || !reply.trim()) {
     throw new ChatApiError("接口没有返回有效的文字回复。");

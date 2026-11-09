@@ -1,12 +1,14 @@
 
 
 from src.common.third_party_types import AgentGraph
+from uuid import UUID
 from langchain_core.runnables import RunnableConfig
 from langchain_core.messages import AIMessage
 
-def invoke(user_message: dict[str, str], agent: AgentGraph,session_id) -> str:
+def invoke(user_message: dict[str, str], agent: AgentGraph, session_id: UUID) -> str:
+    """封装 Agent 调用和最终回复解析，会话业务规则由服务层处理。"""
 
-    #1.进行会话id绑定checkpointer的thread_id
+    # 每个会话绑定独立的 thread_id，让 checkpointer 读取对应的历史状态。
     config = RunnableConfig({ "configurable": { "thread_id": str(session_id) } })
 
 

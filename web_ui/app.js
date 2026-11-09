@@ -1,4 +1,4 @@
-import { createSession, getModelList, getSession, getSessionMessages, listSessions, sendChat } from "./api.js?v=model-list-1";
+import { createSession, getModelList, getSession, getSessionMessages, listSessions, sendChat } from "./api.js?v=request-timeout-1";
 
 const $ = (selector) => document.querySelector(selector);
 const input = $("#message-input");
@@ -7,6 +7,7 @@ const threads = [];
 let activeThread;
 let pending = null;
 let loading = false;
+let creationUncertain = false;
 let toastTimer;
 const ACTIVE_SESSION_KEY = "teresa.activeSessionId";
 
@@ -116,6 +117,18 @@ async function refreshThread(thread) {
   thread.historyAvailable = true;
 }
 
+async function requestNewSession() {
+  try {
+    const session = await createSession();
+    creationUncertain = false;
+    return session;
+  } catch (error) {
+    // 新建是写操作；响应丢失后，本页刷新不能再自动创建一次。
+    creationUncertain = true;
+    throw new Error(`${error.message} 后端可能已创建会话，请先刷新列表确认；再次新建可能产生重复会话。`);
+  }
+}
+
 async function selectThread(thread) {
   if (pending || loading) return;
   if (activeThread) activeThread.draft = input.value;
@@ -144,7 +157,7 @@ async function newThread() {
   showError("");
   render();
   try {
-    const session = await createSession();
+    const session = await requestNewSession();
     activeThread = upsertThread(session);
     activeThread.historyAvailable = true;
     rememberSession(session.id);
@@ -172,7 +185,12 @@ async function reloadThreads() {
       if (!ids.has(threads[index].id)) threads.splice(index, 1);
     }
     sessions.forEach(upsertThread);
-    if (threads.length === 0) upsertThread(await createSession());
+    if (threads.length === 0) {
+      if (creationUncertain) {
+        throw new Error("上次新建会话的结果尚未确认，后端可能已创建会话。请稍后刷新列表确认，再决定是否重新新建。");
+      }
+      upsertThread(await requestNewSession());
+    }
     const preferredId = activeThread?.id ?? savedSessionId();
     const thread = threads.find((item) => item.id === preferredId) ?? threads[0];
     await refreshThread(thread);
@@ -341,13 +359,8 @@ $("#chat-form").addEventListener("submit", async (event) => {
   thread.draft = "";
   showError("");
   render();
-  const timer = setTimeout(() => {
-    request.stopReason = "timeout";
-    request.controller.abort();
-  }, 120000);
   try {
     const reply = await sendChat(thread.id, text, { signal: request.controller.signal });
-    clearTimeout(timer);
     thread.messages.push(request.user, {
       role: "assistant", content: reply, createdAt: new Date(),
     });
@@ -369,13 +382,12 @@ $("#chat-form").addEventListener("submit", async (event) => {
     }
   } catch (error) {
     thread.draft = text;
-    showError(request.stopReason === "timeout"
+    showError(error.code === "TIMEOUT"
       ? "等待超过两分钟，后端可能仍在处理。消息已放回输入框，重新发送可能重复执行。"
-      : request.stopReason === "user"
+      : error.code === "ABORTED" && request.stopReason === "user"
         ? "已停止等待，后端可能仍在处理。消息已放回输入框，重新发送可能重复执行。"
         : `${error.message} 消息已放回输入框，后端可能已执行，重新发送可能重复执行。`);
   } finally {
-    clearTimeout(timer);
     pending = null;
     loading = false;
     input.value = thread.draft;

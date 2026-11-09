@@ -4,7 +4,7 @@ from unittest.mock import Mock, patch
 
 import requests
 
-from src.agent_tools.impl import common_tool_impl
+from src.agent_tools.tool_impl import common_tool_impl
 
 
 class WeatherToolTests(unittest.TestCase):

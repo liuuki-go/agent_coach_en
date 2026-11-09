@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { getEventListeners } from "node:events";
 import test from "node:test";
 import {
   buildChatRequest, ChatApiError, createSession, getModelList, getSession, getSessionMessages, listSessions, sendChat,
@@ -9,6 +10,50 @@ const OTHER = "22222222-2222-4222-8222-222222222222";
 const CREATED = "2026-11-05T12:00:00Z";
 const session = { id: SESSION, title: "英语练习", created_at: CREATED, updated_at: CREATED };
 const optionsFor = (data, status = 200) => ({ fetchImpl: async () => Response.json(data, { status }) });
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((onResolve, onReject) => { resolve = onResolve; reject = onReject; });
+  return { promise, resolve, reject };
+}
+
+function mockClock(t) {
+  let now = 0;
+  let nextId = 0;
+  const timers = new Map();
+  t.mock.method(globalThis, "setTimeout", (callback, delay) => {
+    const id = ++nextId;
+    timers.set(id, { callback, at: now + delay, delay });
+    return id;
+  });
+  t.mock.method(globalThis, "clearTimeout", (id) => { timers.delete(id); });
+  return {
+    get pending() { return timers.size; },
+    get delays() { return [...timers.values()].map((timer) => timer.delay); },
+    advance(ms) {
+      now += ms;
+      for (const [id, timer] of [...timers]) {
+        if (timer.at <= now) {
+          timers.delete(id);
+          timer.callback();
+        }
+      }
+    },
+  };
+}
+
+const metadataRequests = [
+  ["会话列表", (options) => listSessions(options)],
+  ["模型列表", (options) => getModelList(options)],
+  ["新建会话", (options) => createSession(options)],
+  ["会话元数据", (options) => getSession(SESSION, options)],
+  ["会话历史", (options) => getSessionMessages(SESSION, options)],
+];
+
+function isError(code, status = 0) {
+  return (error) => error instanceof ChatApiError && error.code === code && error.status === status;
+}
 
 test("只读模型列表使用GET，默认模型可以不在第一项且只返回公开字段", async () => {
   const catalog = await getModelList({
@@ -174,28 +219,279 @@ test("也接受reply对象，无需当前后端没有返回的request_id", async
 test("接口失败保留HTTP状态和错误说明，无效JSON不显示为模型回复", async () => {
   for (const status of [404, 422, 500, 502, 503]) {
     await assert.rejects(sendChat(SESSION, "hello", optionsFor({ detail: "请求未完成" }, status)),
-      (error) => error instanceof ChatApiError && error.status === status && error.message === "请求未完成");
+      (error) => error instanceof ChatApiError && error.status === status
+        && error.code === "REQUEST_FAILED" && error.message === "请求未完成");
   }
-  await assert.rejects(listSessions({ fetchImpl: async () => new Response("not JSON") }), ChatApiError);
+  await assert.rejects(listSessions({ fetchImpl: async () => new Response("not JSON") }), isError("INVALID_JSON", 200));
+  await assert.rejects(listSessions(optionsFor({ error: "服务不可用" }, 503)),
+    (error) => error.code === "REQUEST_FAILED" && error.status === 503 && error.message === "服务不可用");
+  await assert.rejects(listSessions(optionsFor({}, 502)),
+    (error) => error.status === 502 && error.message === "请求失败（HTTP 502）。");
 });
 
 test("网络失败保留输入参数并报错，不自动重发", async () => {
   let attempts = 0;
   await assert.rejects(sendChat(SESSION, "hello", {
     fetchImpl: async () => { attempts++; throw new TypeError("Failed to fetch"); },
-  }), /无法连接后端/);
+  }), (error) => isError("NETWORK_ERROR")(error) && /无法连接后端/.test(error.message));
   assert.equal(attempts, 1);
   assert.deepEqual(buildChatRequest(SESSION, "hello"), { session_id: SESSION, content: "hello" });
 });
 
-test("停止等待信号传给请求，取消不会变成模型回复", async () => {
+test("预先取消的请求不会发送fetch", async (t) => {
+  const clock = mockClock(t);
   const controller = new AbortController();
   controller.abort();
+  let attempts = 0;
   await assert.rejects(sendChat(SESSION, "hello", {
     signal: controller.signal,
-    fetchImpl: async (_url, options) => {
-      assert.equal(options.signal, controller.signal);
-      throw new DOMException("Aborted", "AbortError");
+    fetchImpl: async () => { attempts++; return Response.json("Late reply"); },
+  }), (error) => isError("ABORTED")(error) && error.name === "AbortError");
+  assert.equal(attempts, 0);
+  assert.equal(clock.pending, 0);
+  assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+});
+
+test("ChatApiError兼容message和status并提供默认错误码", () => {
+  const original = new ChatApiError("失败", 503);
+  assert.equal(original.message, "失败");
+  assert.equal(original.status, 503);
+  assert.equal(original.code, "REQUEST_FAILED");
+  assert.equal(new ChatApiError("超时", 0, "TIMEOUT").code, "TIMEOUT");
+});
+
+for (const [name, request] of metadataRequests) {
+  test(`${name}默认10秒超时，adapter忽略abort也会结束等待`, async (t) => {
+    const clock = mockClock(t);
+    let internalSignal;
+    let attempts = 0;
+    const pending = request({
+      fetchImpl: (_url, options) => {
+        attempts++;
+        internalSignal = options.signal;
+        return new Promise(() => {});
+      },
+    });
+    const rejected = assert.rejects(pending, isError("TIMEOUT"));
+    assert.deepEqual(clock.delays, [10_000]);
+    clock.advance(9_999);
+    assert.equal(internalSignal.aborted, false);
+    clock.advance(1);
+    await rejected;
+    assert.equal(internalSignal.aborted, true);
+    assert.equal(attempts, 1);
+    assert.equal(clock.pending, 0);
+  });
+}
+
+test("聊天默认等待120秒，显式undefined仍使用聊天默认值", async (t) => {
+  const clock = mockClock(t);
+  for (const options of [{}, { timeoutMs: undefined }]) {
+    let signal;
+    const pending = sendChat(SESSION, "hello", {
+      ...options,
+      fetchImpl: (_url, request) => { signal = request.signal; return new Promise(() => {}); },
+    });
+    const rejected = assert.rejects(pending, isError("TIMEOUT"));
+    assert.deepEqual(clock.delays, [120_000]);
+    clock.advance(119_999);
+    assert.equal(signal.aborted, false);
+    clock.advance(1);
+    await rejected;
+    assert.equal(signal.aborted, true);
+    assert.equal(clock.pending, 0);
+  }
+});
+
+test("所有请求包装允许覆盖有限正数timeoutMs", async (t) => {
+  const clock = mockClock(t);
+  const requests = [...metadataRequests, ["聊天", (options) => sendChat(SESSION, "hello", options)]];
+  for (const [name, request] of requests) {
+    const pending = request({ timeoutMs: 25, fetchImpl: () => new Promise(() => {}) });
+    const rejected = assert.rejects(pending, isError("TIMEOUT"), name);
+    assert.deepEqual(clock.delays, [25]);
+    clock.advance(25);
+    await rejected;
+    assert.equal(clock.pending, 0);
+  }
+});
+
+test("无效timeoutMs在发送请求之前拒绝，不静默使用默认值", async (t) => {
+  const clock = mockClock(t);
+  let attempts = 0;
+  const requests = [...metadataRequests, ["聊天", (options) => sendChat(SESSION, "hello", options)]];
+  for (const [name, request] of requests) {
+    for (const timeoutMs of [0, -1, NaN, Infinity, -Infinity, "100", null, false]) {
+      await assert.rejects(request({
+        timeoutMs,
+        fetchImpl: async () => { attempts++; return Response.json([]); },
+      }), (error) => isError("REQUEST_FAILED")(error) && /有限正数/.test(error.message), name);
+    }
+  }
+  assert.equal(attempts, 0);
+  assert.equal(clock.pending, 0);
+});
+
+test("响应头已返回但JSON挂起时仍使用同一个deadline", async (t) => {
+  const clock = mockClock(t);
+  const headers = deferred();
+  const body = deferred();
+  let bodyStarted = false;
+  let internalSignal;
+  const pending = listSessions({
+    timeoutMs: 100,
+    fetchImpl: (_url, options) => { internalSignal = options.signal; return headers.promise; },
+  });
+  const rejected = assert.rejects(pending, isError("TIMEOUT"));
+  clock.advance(90);
+  headers.resolve({
+    ok: true, status: 200,
+    json: () => { bodyStarted = true; return body.promise; },
+  });
+  await Promise.resolve();
+  assert.equal(bodyStarted, true);
+  clock.advance(10);
+  await rejected;
+  assert.equal(internalSignal.aborted, true);
+  assert.equal(clock.pending, 0);
+  body.resolve([session]);
+  await new Promise(setImmediate);
+  await assert.rejects(pending, isError("TIMEOUT"));
+});
+
+test("主动取消会中止独立signal并结束不响应abort的fetch", async (t) => {
+  const clock = mockClock(t);
+  const controller = new AbortController();
+  let internalSignal;
+  const pending = sendChat(SESSION, "hello", {
+    signal: controller.signal,
+    fetchImpl: (_url, options) => { internalSignal = options.signal; return new Promise(() => {}); },
+  });
+  const rejected = assert.rejects(pending,
+    (error) => isError("ABORTED")(error) && error.name === "AbortError");
+  assert.notEqual(internalSignal, controller.signal);
+  assert.equal(getEventListeners(controller.signal, "abort").length, 1);
+  controller.abort();
+  await rejected;
+  assert.equal(internalSignal.aborted, true);
+  assert.equal(clock.pending, 0);
+  assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+});
+
+test("读取JSON时主动取消不会被误报为无效JSON", async (t) => {
+  const clock = mockClock(t);
+  const controller = new AbortController();
+  let bodyStarted = false;
+  const pending = listSessions({
+    signal: controller.signal,
+    fetchImpl: async (_url, options) => ({
+      ok: true, status: 200,
+      json: () => {
+        bodyStarted = true;
+        return new Promise((_resolve, reject) => {
+          options.signal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), { once: true });
+        });
+      },
+    }),
+  });
+  const rejected = assert.rejects(pending,
+    (error) => isError("ABORTED")(error) && error.name === "AbortError");
+  await Promise.resolve();
+  assert.equal(bodyStarted, true);
+  controller.abort();
+  await rejected;
+  assert.equal(clock.pending, 0);
+  assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+});
+
+test("成功、HTTP错误、JSON错误和网络错误后均清理timer和外部监听器", async (t) => {
+  const clock = mockClock(t);
+  const outcomes = [
+    { fetchImpl: async () => Response.json([]) },
+    { fetchImpl: async () => Response.json({ detail: "失败" }, { status: 503 }), code: "REQUEST_FAILED" },
+    { fetchImpl: async () => new Response("invalid"), code: "INVALID_JSON" },
+    { fetchImpl: async () => { throw new TypeError("Network failed"); }, code: "NETWORK_ERROR" },
+  ];
+  for (const { fetchImpl, code } of outcomes) {
+    const controller = new AbortController();
+    const pending = listSessions({ signal: controller.signal, fetchImpl });
+    if (code) await assert.rejects(pending, (error) => error.code === code);
+    else assert.deepEqual(await pending, []);
+    assert.equal(clock.pending, 0);
+    assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+    controller.abort();
+    clock.advance(10_000);
+  }
+});
+
+test("超时清理外部监听器且不会取消调用者的signal", async (t) => {
+  const clock = mockClock(t);
+  const controller = new AbortController();
+  let internalSignal;
+  const pending = listSessions({
+    signal: controller.signal,
+    fetchImpl: (_url, options) => { internalSignal = options.signal; return new Promise(() => {}); },
+  });
+  const rejected = assert.rejects(pending, isError("TIMEOUT"));
+  clock.advance(10_000);
+  await rejected;
+  assert.equal(internalSignal.aborted, true);
+  assert.equal(controller.signal.aborted, false);
+  assert.equal(clock.pending, 0);
+  assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+});
+
+test("超时和主动取消竞态保留最先发生的原因", async (t) => {
+  const clock = mockClock(t);
+  for (const first of ["TIMEOUT", "ABORTED"]) {
+    const controller = new AbortController();
+    const pending = listSessions({
+      signal: controller.signal, timeoutMs: 25,
+      fetchImpl: () => new Promise(() => {}),
+    });
+    const rejected = assert.rejects(pending, isError(first));
+    if (first === "TIMEOUT") {
+      clock.advance(25);
+      controller.abort();
+    } else {
+      controller.abort();
+      clock.advance(25);
+    }
+    await rejected;
+    assert.equal(clock.pending, 0);
+    assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+  }
+});
+
+test("超时后adapter迟到拒绝仍保留TIMEOUT且不会产生未处理的拒绝", async (t) => {
+  const clock = mockClock(t);
+  const response = deferred();
+  const pending = listSessions({ timeoutMs: 25, fetchImpl: () => response.promise });
+  const rejected = assert.rejects(pending, isError("TIMEOUT"));
+  clock.advance(25);
+  await rejected;
+  response.reject(new TypeError("Late network failure"));
+  await new Promise(setImmediate);
+  await assert.rejects(pending, isError("TIMEOUT"));
+  assert.equal(clock.pending, 0);
+});
+
+test("网络错误先完成时后续deadline不会替换错误原因或重试", async (t) => {
+  const clock = mockClock(t);
+  let attempts = 0;
+  let internalSignal;
+  const pending = listSessions({
+    timeoutMs: 25,
+    fetchImpl: (_url, options) => {
+      attempts++;
+      internalSignal = options.signal;
+      throw new TypeError("Network failed");
     },
-  }), { name: "AbortError" });
+  });
+  const rejected = assert.rejects(pending, isError("NETWORK_ERROR"));
+  clock.advance(25);
+  await rejected;
+  assert.equal(internalSignal.aborted, false);
+  assert.equal(attempts, 1);
+  assert.equal(clock.pending, 0);
 });

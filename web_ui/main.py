@@ -8,7 +8,7 @@ if __package__ in (None, ""):
 import uvicorn
 from fastapi.staticfiles import StaticFiles
 
-from src.router.web_server import app
+from src.router.chat_api import app
 
 
 # 复用现有聊天路由，最后挂载静态页面，让网页与 API 使用同一个地址。
