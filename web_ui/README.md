@@ -52,7 +52,7 @@ model_list:
 - 刷新、切换或重开页面时，读取当前会话未确认的请求并查询状态，不自动 POST。“查询结果”只读；“重试原消息”复用原 ID；确认失败后点击“开始新消息”，之后的发送才使用新 ID。未确认时编辑正文不能覆盖原请求。
 - 历史消息当前没有创建时间，页面不显示历史消息时间，也不伪造消息 ID、时间、会话标题或更新时间。本次发送和收到回复的本地时间仅用于同步前的即时显示。
 
-当前历史接口读取的是 Agent 最新保存状态中的可展示消息，页面显示范围取决于后端保留的状态。后续如果后端裁剪或摘要旧消息，最新状态可能不再包含全部原始聊天记录；完整档案、分页和搜索需按后续业务需求另行实现。本轮只适配前端，没有改动 checkpoint 的后端实现。
+历史接口读取独立的 `chat_messages` 业务档案，保存成功轮次的用户原文与最终助手回复。Agent 的 Checkpoint 继续负责会话接续；模型调用前按预算临时选择近期输入，不删除网页档案或 Checkpoint 原消息。摘要、分页、搜索和失败消息展示仍可后续实现。
 
 ## 当前实际 API
 
@@ -68,7 +68,7 @@ model_list:
 
 会话对象包含 `id`、`title`、`created_at`、`updated_at`。时间为 ISO 字符串，前端转换为 `Date`。`createSession` 当前字段名虽为 `session_id`，其值实际是完整会话对象；前端已按这个现状解包。
 
-历史消息对象包含 `id`（字符串或 `null`）、`role`（`user` 或 `assistant`）与 `content`（文字）。接口不返回逐条消息时间，前端不要求该字段；消息顺序沿用后端数组顺序。系统消息、工具结果和工具调用中间消息由后端过滤，前端也校验可展示角色。
+历史消息对象包含 `id`（业务消息 UUID 字符串）、`role`（`user` 或 `assistant`）与 `content`（文字）；前端继续兼容旧的空 ID。接口不公开逐条消息时间，顺序按业务档案的 `sequence` 升序。系统指令、工具结果和工具调用中间消息留在 Agent 状态中，不作为聊天档案写入。
 
 网页聊天只发送当前会话 ID、本次用户输入和这次发送的请求 ID：
 
@@ -100,6 +100,79 @@ model_list:
 
 `chat_requests` 由启动流程在会话表之后初始化；`CREATE TABLE IF NOT EXISTS` 不会升级已有旧表结构。本阶段沿用单进程会话锁，多个 worker 下不同请求 ID 修改同一会话还需要额外协调。
 
+## 聊天档案与事务
+
+`MessageStore` 位于 `src/common/db/message_store.py`。`chat_messages` 保存业务消息 ID、会话 ID、可空的请求 ID、角色、原文、归档时间 `created_at` 和稳定排序字段 `sequence`。`created_at` 表示归档写入时间，不代表浏览器发送或收到消息的精确时间；`sequence` 可以有空号，不用于计数。第一版每个成功请求仅有一条用户消息和一条最终助手回复，通过 `UNIQUE(request_id, role)` 防止同 ID 重复归档。失败原文与安全错误仍由 `chat_requests` 保存，不伪造成功回复。无 ID 的旧调用也保存消息对，但不增加请求记录或幂等保证。
+
+事务边界放在服务层的 `_save_chat_success`，模型调用成功后才执行：
+
+```python
+with message_store.pool.connection() as connection:
+    with connection.transaction():
+        message_store.add_exchange(
+            connection, session_id, request_id, content, reply,
+        )
+        if request_id is not None:
+            saved = request_store.mark_succeeded(
+                request_id, reply, connection=connection,
+            )
+            if not saved:
+                raise ChatError("REQUEST_STATE_UNKNOWN", "请求状态未能确认")
+```
+
+两个 Store 使用同一个 `connection`，不自行提交：正常退出事务块才提交；插入异常、终态更新异常或更新行数为零时，在块内抛错，使消息对和成功状态一起回滚。模型生成不在此事务中，避免长时间占用事务。连接池的 `autocommit=True` 不影响这里的显式事务，这是 [Psycopg 官方支持的事务用法](https://www.psycopg.org/psycopg3/docs/basic/transactions.html)。归档或提交结果不明时，带 ID 请求返回 503 并保留原 ID，不把它改写成模型失败；无 ID 的旧调用返回安全的 `CHAT_HISTORY_SAVE_FAILED`，需要人工确认，不能承诺去重。
+
+本次复用现有 Psycopg、PostgreSQL 约束和事务，不增加依赖。已评估 LangChain 的 `PostgresChatMessageHistory`，其通用框架消息结构不直接包含业务请求约束，当前写入实现还会自行 `commit()`，不适合直接组合到这个业务提交边界；参考 [官方实现](https://github.com/langchain-ai/langchain-postgres/blob/main/langchain_postgres/chat_message_histories.py)。现有 LangGraph `PostgresSaver` 保持不变；它的执行快照与业务事务仍分别提交，进程崩溃协调和自动恢复未在本项实现。
+
+重启后，启动流程按会话表、请求表、消息表的顺序初始化。消息表初始化会幂等回填已有 `succeeded` 请求中的原文和回复；首次回填按请求创建时间、请求 ID、用户/助手顺序写入，重复启动不覆盖已有消息。回填的 `created_at` 是本次归档时间，不猜测历史发送时间。缺项采用追加归档顺序，不支持混跑旧版本后重新整理历史顺序。只有 Checkpoint、没有成功请求记录的更早聊天仍留在框架中，需要单独导出迁移；历史接口不以 Checkpoint 作为空档案的隐式回退来源。
+
+聊天档案与 Agent 状态使用独立数据源。调用 Agent 仍只传本轮新输入，既有上下文由 Checkpointer 接续；不把整份档案重复传入 Agent。每次模型调用的预算与临时选择见下节，摘要和跨会话偏好后续实现。
+
+## 上下文预算与临时输入选择
+
+`config/sys_config.yaml` 现在包含独立配置，修改后重启服务生效：
+
+```yaml
+context_budget:
+  context_window_tokens: 8192
+  max_output_tokens: 1024
+  safety_margin_tokens: 512
+  chars_per_token: 1.0
+```
+
+- `context_window_tokens`：项目设置的总窗口，同时传给 ChatOllama 的 `num_ctx`。初始值 8192 是本项目的运行设置，不是自动探测出的模型或硬件上限；需结合实际内存与模型能力调整。
+- `max_output_tokens`：生成预留，同时传给 `num_predict`。达到生成上限可能使回复不完整，不应把它理解成模型一定生成这么多 token。
+- `safety_margin_tokens`：为聊天模板和估算误差预留的空间。
+- `chars_per_token`：内置近似计数的字符/token 参数。中英混合内容先用较保守的 1.0；越小估算 token 越多，需要用实际模型统计校准。
+
+可用估算输入预算为 `8192 - 1024 - 512 = 6656`。四项均需显式配置，启动时使用现有 Pydantic 验证类型、范围、未知字段和预算关系；验证失败先于数据库资源初始化。模型和中间件共享缓存的冻结配置，避免两边使用不同预算。模型名称列表仍只公开名称与显示名，不向浏览器公开预算或连接配置。
+
+`src/agents/english_teacher/context_policy.py` 复用 LangChain 的 `wrap_model_call`、`request.override()`、`trim_messages` 和 `count_tokens_approximately`，没有增加依赖。每次模型调用都执行以下步骤：
+
+1. 找到最后一条 `HumanMessage`，保护从它开始到末尾的本轮全部消息，包含当前工具调用和匹配结果。
+2. 将独立的 `system_message`、工具定义和本轮内容一起计数；这些必需内容本身超过预算时，直接拒绝调用模型，不静默截断当前问题或工具结果。
+3. 使用内置 `trim_messages(strategy="last", start_on="human", allow_partial=False)` 在剩余空间选择最近历史，从用户消息边界开始，不切分消息原文。
+4. 再次检查所选工具 ID 配对和总估算，只把新列表放入 `request.override(messages=...)`。原消息对象、`request.state`、Checkpoint 和 MessageStore 都不被删改。
+
+一次 HTTP 请求可能执行多次模型调用，工具结果返回后会再次经过上述选择。临时选择减少的是每次发送给模型的内容，Checkpoint 仍会积累；本阶段不做持久摘要、长期记忆或旧状态清理。当前中间件适配项目的同步 `agent.invoke()`，将来切换 `ainvoke()` 需补充异步 hook。
+
+超预算返回 `CONTEXT_LIMIT_EXCEEDED`（HTTP 413），缺失本轮用户消息或工具记录不完整返回 `CONTEXT_STATE_INVALID`（HTTP 409）。服务层保留具体错误并保存请求 `failed`，不写成功聊天档案；同 ID 重试回放原错误，不再次执行模型。前端可先“查询结果”确认失败，再“开始新消息”编辑发送；不完整的旧工具链按提示新建会话。错误发生前图可能已经保存本轮输入或工具结果，`failed` 不代表 Checkpoint 回滚。
+
+### Token 估算与 UI 用量
+
+本次估算用于后端预算控制，保持原有聊天字符串响应；UI 暂不显示 token 用量。每次模型调用产生安全的 INFO 日志事件，包含选择前后的 `estimated_input_tokens_before/after`、`input_budget_tokens` 和 `dropped_messages`；超限还记录必需输入的估算数值。日志不包含用户原文、系统提示词或工具实参，是否在终端显示由日志级别和 handler 决定。
+
+近似计数不能当作 Qwen 精确 tokenizer：当前 ChatOllama 的基类计数还会忽略工具 schema，因此本项目使用支持工具定义的内置近似函数，并明确保留误差余量。`chars_per_token` 与余量不能提供严格不超窗保证；严格计数需要匹配模型 tokenizer 和实际聊天模板。
+
+将来 UI 展示应区分两种信息：
+
+| 信息 | 来源与含义 |
+| --- | --- |
+| 本次上下文预计占用/剩余 | 调用前的近似预算，需标注“估算” |
+| 整轮输入、输出 token 与耗时 | 各次模型响应的实际统计按请求累计，包含工具循环中的多次调用 |
+
+这需要单独扩展返回协议、按 `request_id` 保存统计并在回放时复用，不能只展示最后一次模型调用，或把估算冒充实际消耗。本次没有新增 UI 字段、用量持久化或累计计费逻辑。
+
 ## 失败与停止等待
 
 所有请求通过 `api.js` 统一控制超时：模型列表、会话列表、详情、历史、新建会话和请求状态查询默认每次 10 秒；聊天请求默认 120 秒。内部调用可通过 `timeoutMs` 覆盖为有限正数。上限覆盖发送请求及读取 JSON 响应体；串行读取多个接口时，每次请求分别计时。
@@ -122,7 +195,7 @@ model_list:
 
 在 VS Code 中选择解释器 `D:\conda_env\langchain\python.exe`，输入 `agent.` 后可用 `Ctrl+Space` 查看补全，用 `F12` 跳转。Agent 的 `invoke` 实现继承自 `Pregel`，跳转到父类是正常行为。
 
-当前聊天调用已经通过状态输入与 `thread_id` 接入 Agent；历史查询使用相同的会话 ID 读取状态。类型提示仍只帮助编辑器，真实数据库、模型和工具执行能力需要独立联调。
+当前聊天调用通过状态输入与 `thread_id` 接入 Agent；网页历史使用相同的会话 ID 读取独立业务档案。类型提示仍只帮助编辑器，真实数据库、模型和工具执行能力需要独立联调。
 
 ## 验证
 
@@ -140,10 +213,27 @@ Node.js 只用于测试。前端 106 项测试通过，包含 API、请求存储
 
 服务启动后打开 [消息布局回归测试](http://127.0.0.1:6576/tests/layout.test.html)，页面会在 320、390、1280、1920px 四种视口中加载实际前端，检查用户消息靠右且为绿色、AI 消息靠左且为白色，以及长文本、代码块和等待回复时的布局。测试 iframe 隔离 API 和浏览器存储，不读写真实聊天记录或已选会话。
 
-Python 测试覆盖实际 FastAPI 的聊天请求、异常与锁行为、模型配置校验、只读列表和启动加载，以及天气工具错误处理。它同样隔离真实数据库、模型和天气 HTTP 调用。
+后端隔离测试 156 项通过，覆盖实际 FastAPI 的聊天请求、独立档案读取、同连接事务编排、上下文配置与临时选择、错误与锁行为、模型配置校验、只读列表和启动加载，以及天气工具错误处理；隔离真实数据库、模型和天气 HTTP 调用。默认发现共 164 项，其中 8 项真实数据库测试跳过，需要显式开启。
+
+上下文新增 17 项配置/选择单元测试和 7 项真实 LangChain 图集成测试。后者使用测试模型与工具、`InMemorySaver` 驱动实际 `create_agent`，验证跨轮输入缩短、原状态和消息 ID 保留、工具返回后再次选择、当前问题/工具结果/system/工具定义超限时不继续调用模型，以及会话隔离。另适配模型参数、启动校验、错误保存回放和 HTTP 契约测试。生产模型仍是 ChatOllama，没有替换为测试模型。
+
+本次另在 PostgreSQL 18.6 上完成 8 项集成测试，使用真实 Store、SQL 和约束，覆盖成功回放、归档约束失败、终态更新后抛错/零行更新的回滚、旧调用与会话隔离、成功请求回填和重复初始化。每项都使用随机隔离 schema 和外层强制回滚，并检查 schema 已消失；没有初始化正式 `chat_messages` 或修改已有聊天记录。这证明 SQL 和事务回滚行为，不等同独立连接提交可见性、真实模型或浏览器端到端联调。
+
+如需重复运行真实数据库验证，先启动配置中的 PostgreSQL，再执行：
+
+```powershell
+$env:CHAT_TEST_POSTGRES = '1'
+try {
+    & 'D:\conda_env\langchain\python.exe' -B -m unittest src.test.test_message_store_postgres -v
+} finally {
+    Remove-Item Env:CHAT_TEST_POSTGRES -ErrorAction SilentlyContinue
+}
+```
 
 真实联调可在 A 会话发送一段内容，切到 B 确认互不混入，再切回 A、刷新整个页面，确认服务端历史可恢复。随后重启后端再次读取 A；还应验证空会话和查询失败时的提示。当前历史未提供消息时间，页面不应出现虚构的历史时间。
 
-本次升级后先重启后端，让启动流程初始化 `chat_requests`，并确认连接到预期数据库。浏览器开发者工具的 Network 中应看到 POST 带 `request_id`；发送后停止等待，再查询结果或重开页面，应出现 GET 状态查询，同 ID 重试的正文与 ID 应保持一致，模型不重复执行。这些真实浏览器与 Ollama 验证仍需实际运行。
+本次升级后先重启后端，让启动流程初始化 `chat_messages` 并回填旧成功请求，确认连接到预期数据库。浏览器开发者工具的 Network 中应看到 POST 带 `request_id`；发送后停止等待，再查询结果或重开页面，应出现 GET 状态查询，同 ID 重试的正文与 ID 应保持一致，模型不重复执行。历史接口应返回业务消息 UUID，重复刷新不增加记录。这些真实浏览器与 Ollama 验证仍需实际运行。
+
+上下文配置已用真实配置、系统提示词与工具定义执行离线检查：总估算输入预算 6656，ChatOllama 构造参数为 `num_ctx=8192/num_predict=1024`；长历史被排除而原列表保留。未触发真实 Ollama 生成或模型加载，尚未验证实际显存开销、生成完整性与教学质量。服务使用新配置生成后，可用 `ollama ps` 核对实际运行窗口，再比较长对话的输入统计、耗时和近期指代接续效果。
 
 头像与欢迎页使用 `assets/teresa.png`。回复支持基础加粗、行内代码和代码块，其余 Markdown 按普通文字显示；模型内容只创建文本节点，不执行返回的 HTML。

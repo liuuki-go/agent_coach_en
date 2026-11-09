@@ -76,6 +76,47 @@ class RequestStoreTests(unittest.TestCase):
                 self.assertIn("WHERE request_id = %s AND status = 'processing'", sql)
                 self.assertIn("status = 'failed'", sql)
 
+    def test_success_uses_the_supplied_connection_without_owning_its_transaction(self):
+        connection = MagicMock()
+        reply = "  It's a shared-transaction reply.  "
+        for rowcount, expected in [(1, True), (0, False)]:
+            with self.subTest(rowcount=rowcount):
+                connection.execute.reset_mock()
+                connection.execute.return_value.rowcount = rowcount
+
+                self.assertIs(
+                    self.store.mark_succeeded(self.request_id, reply, connection=connection),
+                    expected,
+                )
+
+                sql, parameters = connection.execute.call_args.args
+                self.assertEqual(parameters, (reply, self.request_id))
+                self.assertIn("AND status = 'processing'", " ".join(sql.split()))
+                connection.execute.assert_called_once()
+                self.pool.connection.assert_not_called()
+                connection.commit.assert_not_called()
+                connection.rollback.assert_not_called()
+                connection.transaction.assert_not_called()
+                connection.close.assert_not_called()
+                connection.__enter__.assert_not_called()
+                connection.__exit__.assert_not_called()
+
+    def test_supplied_connection_failure_propagates_to_the_outer_transaction(self):
+        connection = MagicMock()
+        error = RuntimeError("Shared transaction failed")
+        connection.execute.side_effect = error
+
+        with self.assertRaises(RuntimeError) as raised:
+            self.store.mark_succeeded(self.request_id, "Reply", connection=connection)
+
+        self.assertIs(raised.exception, error)
+        self.pool.connection.assert_not_called()
+        connection.commit.assert_not_called()
+        connection.rollback.assert_not_called()
+        connection.close.assert_not_called()
+        connection.__enter__.assert_not_called()
+        connection.__exit__.assert_not_called()
+
     def test_database_errors_are_propagated_and_connections_are_released(self):
         operations = [
             self.store.setup,

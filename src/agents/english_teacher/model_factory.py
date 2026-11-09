@@ -6,6 +6,7 @@ import httpx
 from langchain_ollama import ChatOllama
 
 from config.config_anasize import get_config_value
+from .context_policy import get_context_budget
 
 
 @dataclass(frozen=True)
@@ -91,10 +92,14 @@ def get_model() -> ChatOllama:
     if _model is None:
         catalog = _get_catalog()
         selected = next(model for model in catalog.models if model.name == catalog.default)
+        budget = get_context_budget()
         _model = ChatOllama(
             model=selected.name,
             base_url=selected.base_url,
             temperature=selected.temperature,
+            # 与输入选择共用同一份配置，生成预留和 Ollama 运行窗口保持一致。
+            num_ctx=budget.context_window_tokens,
+            num_predict=budget.max_output_tokens,
             client_kwargs={"timeout": httpx.Timeout(60.0, connect=5.0)},
         )
     return _model

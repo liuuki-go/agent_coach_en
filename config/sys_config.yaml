@@ -19,3 +19,10 @@ model_list:
     display_name: qwen3.5:4b-q4_K_M
     base_url: http://localhost:11434
     temperature: 0.0
+
+# 每次模型调用的上下文预算。修改后重启服务；这是项目初始配置，需结合实际内存调整。
+context_budget:
+  context_window_tokens: 8192  # 同时传给 Ollama num_ctx，并作为总窗口预算
+  max_output_tokens: 1024      # 同时传给 num_predict，预留生成空间
+  safety_margin_tokens: 512   # 为模板开销及估算误差预留；不是精确 token 保证
+  chars_per_token: 1.0        # 中英混合内容采用保守估算，数值越小估算 token 越多

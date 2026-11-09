@@ -1,6 +1,7 @@
 
 from uuid import UUID
 
+from psycopg import Connection
 from psycopg.rows import DictRow
 
 from src.common.third_party_types import DatabasePool
@@ -72,22 +73,32 @@ class RequestStore:
                 (request_id,),
             ).fetchone()
 
-    def mark_succeeded(self, request_id: UUID, reply: str) -> bool:
-        with self.pool.connection() as connection:
-            cursor = connection.execute(
-                """
-                    UPDATE chat_requests
-                    SET status = 'succeeded',
-                        reply = %s,
-                        error_code = NULL,
-                        error_message = NULL,
-                        updated_at = now()
-                    WHERE request_id = %s
-                        AND status = 'processing'
-                """,
-                (reply, request_id),
-            )
-            return cursor.rowcount == 1
+    def mark_succeeded(
+        self,
+        request_id: UUID,
+        reply: str,
+        *,
+        connection: Connection[DictRow] | None = None,
+    ) -> bool:
+        if connection is None:
+            with self.pool.connection() as own_connection:
+                return self.mark_succeeded(request_id, reply, connection=own_connection)
+
+        # 使用调用方的连接，不自行提交，使请求终态和消息归档共享事务。
+        cursor = connection.execute(
+            """
+                UPDATE chat_requests
+                SET status = 'succeeded',
+                    reply = %s,
+                    error_code = NULL,
+                    error_message = NULL,
+                    updated_at = now()
+                WHERE request_id = %s
+                    AND status = 'processing'
+            """,
+            (reply, request_id),
+        )
+        return cursor.rowcount == 1
 
     def mark_failed(
         self,

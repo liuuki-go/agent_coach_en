@@ -6,6 +6,7 @@ from src.common.third_party_types import AgentGraph, CheckpointSaver, ToolDefini
 
 from .template import SYSTEM_PROMPT
 from .model_factory import get_model
+from .context_policy import create_context_middleware, get_context_budget
 
 
 def build_agent(
@@ -19,5 +20,6 @@ def build_agent(
         tools=tools,
         system_prompt=SYSTEM_PROMPT,
         checkpointer=checkpointer,
+        middleware=[create_context_middleware(get_context_budget())],
     )
 

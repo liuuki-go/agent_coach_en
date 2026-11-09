@@ -6,15 +6,11 @@ from langgraph.checkpoint.postgres import PostgresSaver
 from src.common.dababase_pool import create_db_pool
 from src.agents.english_teacher.agent_factory import build_agent
 from src.agents.english_teacher.model_factory import get_model_list
+from src.agents.english_teacher.context_policy import get_context_budget
 from src.common.db.session_store import SessionStore
 from src.common.db.request_store import RequestStore
+from src.common.db.message_store import MessageStore
 from uuid import UUID
-from src.common.third_party_types import AgentGraph
-from typing import Literal
-
-from langchain_core.messages import AIMessage, HumanMessage
-from langchain_core.runnables import RunnableConfig
-
 from src.domains.session_domain import SessionMessageResponse
 from src.agent_tools.common_tool import common_tools
 from src.common.agent_lock import SessionLocks
@@ -38,11 +34,15 @@ _CHAT_ERROR_STATUS = {
     "REQUEST_PROCESSING": 409,
     "REQUEST_STATE_UNKNOWN": 503,
     "REQUEST_NOT_FOUND": 404,
+    "CHAT_HISTORY_SAVE_FAILED": 503,
+    "CONTEXT_LIMIT_EXCEEDED": 413,
+    "CONTEXT_STATE_INVALID": 409,
 }
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     model_list = get_model_list()
+    get_context_budget()
     pool = create_db_pool()
 
     try:
@@ -55,6 +55,8 @@ async def lifespan(app: FastAPI):
         session_store.setup()
         request_store = RequestStore(pool)
         request_store.setup()
+        message_store = MessageStore(pool)
+        message_store.setup()
 
 
         print("数据库连接池和 checkpointer 已就绪")
@@ -73,6 +75,7 @@ async def lifespan(app: FastAPI):
         app.state.model_list = model_list
         app.state.session_store = session_store
         app.state.request_store = request_store
+        app.state.message_store = message_store
         app.state.session_locks = SessionLocks()
         yield
 
@@ -119,6 +122,7 @@ def chat(request: UserMessage) -> str:
             session_locks=app.state.session_locks,
             request_id=request.request_id,
             request_store=app.state.request_store,
+            message_store=app.state.message_store,
         )
     except ChatError as exc:
         raise HTTPException(
@@ -184,45 +188,27 @@ def get_session_messages(
     request: GetSessionByIdRequest,
 ) -> list[SessionMessageResponse]:
     session_store: SessionStore = app.state.session_store
+    message_store: MessageStore = app.state.message_store
+    try:
+        session = session_store.get_session(request.session_id)
+        # 历史只读业务档案；Checkpoint 中的消息裁剪不会影响网页记录。
+        messages = [] if session is None else message_store.list_messages(request.session_id)
+    except Exception as exc:
+        logger.error(
+            "chat_history_read_failed session_id=%s error_type=%s",
+            request.session_id, type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=503, detail="聊天档案暂时无法读取，请稍后重试",
+        ) from None
 
-    if session_store.get_session(request.session_id) is None:
+    if session is None:
         raise HTTPException(status_code=404, detail="会话不存在")
 
-    agent: AgentGraph = app.state.agent
-    config: RunnableConfig = {
-        "configurable": {
-            "thread_id": str(request.session_id),
-        }
-    }
-
-    snapshot = agent.get_state(config)
-    saved_messages = snapshot.values.get("messages", [])
-    
-    # 组装response 
-    result: list[SessionMessageResponse] = []
-    for message in saved_messages:
-        role: Literal["user", "assistant"]
-
-        if isinstance(message, HumanMessage):
-            role = "user"
-        elif isinstance(message, AIMessage) and not message.tool_calls:
-            role = "assistant"
-        else:
-            continue
-
-        content = str(message.text)
-        if not content.strip():
-            continue
-
-        result.append(
-            SessionMessageResponse(
-                id=message.id,
-                role=role,
-                content=content,
-            )
-        )
-
-    return result
+    return [
+        SessionMessageResponse(id=str(message["id"]), role=message["role"], content=message["content"])
+        for message in messages
+    ]
 
 def valid_chat_request(request: UserMessage) -> bool:
     if not isinstance(request.session_id, UUID):

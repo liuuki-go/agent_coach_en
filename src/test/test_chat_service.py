@@ -1,13 +1,14 @@
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier, Event
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 from uuid import UUID
 
 import httpx
 from ollama import ResponseError
 
 from src.common.agent_lock import SessionLocks
+from src.common.db.message_store import MessageStore
 from src.common.db.request_store import RequestStore
 from src.domains.error_domain import ChatError
 from src.service import chat_service
@@ -28,6 +29,10 @@ class ChatServiceTests(unittest.TestCase):
         self.request_store.try_start.return_value = {"request_id": self.request_id}
         self.request_store.mark_succeeded.return_value = True
         self.request_store.mark_failed.return_value = True
+        self.message_store = Mock(spec=MessageStore)
+        self.message_store.pool = MagicMock()
+        self.connection = self.message_store.pool.connection.return_value.__enter__.return_value
+        self.transaction = self.connection.transaction.return_value
         patcher = patch.object(chat_service, "invoke", return_value="Hello")
         self.invoke = patcher.start()
         self.addCleanup(patcher.stop)
@@ -40,6 +45,7 @@ class ChatServiceTests(unittest.TestCase):
             session_store=self.session_store,
             session_locks=self.session_locks,
             request_store=self.request_store,
+            message_store=self.message_store,
             request_id=request_id,
         )
 
@@ -65,6 +71,10 @@ class ChatServiceTests(unittest.TestCase):
         )
         self.session_store.touch_session.assert_called_once_with(self.session_id)
         self.assertEqual(self.request_store.mock_calls, [])
+        self.message_store.add_exchange.assert_called_once_with(
+            self.connection, self.session_id, None, content, "Hello"
+        )
+        self.transaction.__exit__.assert_called_once_with(None, None, None)
         self.assert_session_lock_released()
 
     def test_missing_session_does_not_invoke_the_agent_or_update_activity(self):
@@ -77,6 +87,8 @@ class ChatServiceTests(unittest.TestCase):
         self.assertEqual(raised.exception.message, "会话不存在")
         self.invoke.assert_not_called()
         self.session_store.touch_session.assert_not_called()
+        self.message_store.add_exchange.assert_not_called()
+        self.message_store.pool.connection.assert_not_called()
 
     def test_busy_session_does_not_release_another_requests_lock(self):
         lock = self.session_locks.get(self.session_id)
@@ -135,6 +147,8 @@ class ChatServiceTests(unittest.TestCase):
                 self.assertNotIn("private upstream details", str(raised.exception))
                 self.session_store.touch_session.assert_not_called()
                 self.assertEqual(self.request_store.mock_calls, [])
+                self.message_store.add_exchange.assert_not_called()
+                self.message_store.pool.connection.assert_not_called()
                 self.assert_session_lock_released()
 
     def test_activity_update_failure_preserves_successful_reply_and_releases_lock(self):
@@ -240,9 +254,11 @@ class ChatServiceTests(unittest.TestCase):
 
         def invoke(**kwargs):
             events.append("invoke")
+            self.message_store.pool.connection.assert_not_called()
             return "Fresh reply"
 
-        def succeed(request_id, reply):
+        def succeed(request_id, reply, *, connection):
+            self.assertIs(connection, self.connection)
             events.append("succeeded")
             return True
 
@@ -252,12 +268,15 @@ class ChatServiceTests(unittest.TestCase):
 
         self.request_store.try_start.side_effect = claim
         self.invoke.side_effect = invoke
+        self.transaction.__enter__.side_effect = lambda: events.append("transaction")
+        self.transaction.__exit__.side_effect = lambda *args: events.append("commit") or False
+        self.message_store.add_exchange.side_effect = lambda *args: events.append("archive")
         self.request_store.mark_succeeded.side_effect = succeed
         self.session_store.touch_session.side_effect = touch
 
         self.assertEqual(self.send_message(content, request_id=self.request_id), "Fresh reply")
 
-        self.assertEqual(events, ["claim", "invoke", "succeeded", "touch"])
+        self.assertEqual(events, ["claim", "invoke", "transaction", "archive", "succeeded", "commit", "touch"])
         self.request_store.get_request.assert_called_once_with(self.request_id)
         self.request_store.try_start.assert_called_once_with(
             request_id=self.request_id, session_id=self.session_id, content=content
@@ -267,7 +286,12 @@ class ChatServiceTests(unittest.TestCase):
             agent=self.agent,
             session_id=self.session_id,
         )
-        self.request_store.mark_succeeded.assert_called_once_with(self.request_id, "Fresh reply")
+        self.message_store.add_exchange.assert_called_once_with(
+            self.connection, self.session_id, self.request_id, content, "Fresh reply"
+        )
+        self.request_store.mark_succeeded.assert_called_once_with(
+            self.request_id, "Fresh reply", connection=self.connection
+        )
         self.request_store.mark_failed.assert_not_called()
         self.assert_session_lock_released()
 
@@ -286,6 +310,8 @@ class ChatServiceTests(unittest.TestCase):
         self.request_store.mark_succeeded.assert_not_called()
         self.request_store.mark_failed.assert_not_called()
         self.session_store.touch_session.assert_not_called()
+        self.message_store.add_exchange.assert_not_called()
+        self.message_store.pool.connection.assert_not_called()
 
     def test_same_request_id_with_different_session_or_content_is_rejected(self):
         conflicting_records = [
@@ -321,6 +347,8 @@ class ChatServiceTests(unittest.TestCase):
         self.request_store.mark_succeeded.assert_not_called()
         self.request_store.mark_failed.assert_not_called()
         self.session_store.touch_session.assert_not_called()
+        self.message_store.add_exchange.assert_not_called()
+        self.message_store.pool.connection.assert_not_called()
 
     def test_unknown_saved_status_never_restarts_the_request(self):
         self.request_store.get_request.return_value = self.saved_request("unexpected")
@@ -411,6 +439,120 @@ class ChatServiceTests(unittest.TestCase):
                 self.assertNotIn("private upstream details", raised.exception.message)
                 self.request_store.mark_succeeded.assert_not_called()
                 self.session_store.touch_session.assert_not_called()
+                self.message_store.add_exchange.assert_not_called()
+                self.message_store.pool.connection.assert_not_called()
+                self.assert_session_lock_released()
+
+    def test_context_errors_are_saved_and_propagated_without_archiving_or_model_retry(self):
+        for code, message in [
+            ("CONTEXT_LIMIT_EXCEEDED", "当前问题和工具结果超过上下文预算，请缩短输入。"),
+            ("CONTEXT_STATE_INVALID", "当前会话的工具消息不完整，请确认后再开始新消息。"),
+        ]:
+            with self.subTest(code=code):
+                self.invoke.reset_mock()
+                self.request_store.mark_failed.reset_mock()
+                error = ChatError(code, message)
+                self.invoke.side_effect = error
+
+                with self.assertRaises(ChatError) as raised:
+                    self.send_message(request_id=self.request_id)
+
+                self.assertIs(raised.exception, error)
+                self.invoke.assert_called_once()
+                self.request_store.mark_failed.assert_called_once_with(self.request_id, code, message)
+                self.request_store.mark_succeeded.assert_not_called()
+                self.session_store.touch_session.assert_not_called()
+                self.message_store.add_exchange.assert_not_called()
+                self.message_store.pool.connection.assert_not_called()
+                self.assert_session_lock_released()
+
+    def test_context_errors_without_request_id_keep_the_original_error_and_skip_request_store(self):
+        error = ChatError("CONTEXT_LIMIT_EXCEEDED", "当前问题超过上下文预算，请缩短输入。")
+        self.invoke.side_effect = error
+
+        with self.assertRaises(ChatError) as raised:
+            self.send_message()
+
+        self.assertIs(raised.exception, error)
+        self.assertEqual(self.request_store.mock_calls, [])
+        self.message_store.add_exchange.assert_not_called()
+        self.message_store.pool.connection.assert_not_called()
+        self.session_store.touch_session.assert_not_called()
+        self.assert_session_lock_released()
+
+    def test_saved_context_failure_is_replayed_without_running_or_archiving_again(self):
+        for code in ["CONTEXT_LIMIT_EXCEEDED", "CONTEXT_STATE_INVALID"]:
+            with self.subTest(code=code):
+                message = "已保存的上下文错误说明"
+                self.request_store.get_request.return_value = self.saved_request(
+                    "failed", error_code=code, error_message=message,
+                )
+
+                with self.assertRaises(ChatError) as raised:
+                    self.send_message(request_id=self.request_id)
+
+                self.assertEqual((raised.exception.code, raised.exception.message), (code, message))
+                self.invoke.assert_not_called()
+                self.request_store.try_start.assert_not_called()
+                self.request_store.mark_failed.assert_not_called()
+                self.request_store.mark_succeeded.assert_not_called()
+                self.message_store.pool.connection.assert_not_called()
+                self.assert_session_lock_released()
+
+    def test_context_errors_are_saved_and_propagated_without_archiving_or_model_retry(self):
+        for code, message in [
+            ("CONTEXT_LIMIT_EXCEEDED", "当前问题和工具结果超过上下文预算，请缩短输入。"),
+            ("CONTEXT_STATE_INVALID", "当前会话的工具消息不完整，请确认后再开始新消息。"),
+        ]:
+            with self.subTest(code=code):
+                self.invoke.reset_mock()
+                self.request_store.mark_failed.reset_mock()
+                error = ChatError(code, message)
+                self.invoke.side_effect = error
+
+                with self.assertRaises(ChatError) as raised:
+                    self.send_message(request_id=self.request_id)
+
+                self.assertIs(raised.exception, error)
+                self.invoke.assert_called_once()
+                self.request_store.mark_failed.assert_called_once_with(self.request_id, code, message)
+                self.request_store.mark_succeeded.assert_not_called()
+                self.session_store.touch_session.assert_not_called()
+                self.message_store.add_exchange.assert_not_called()
+                self.message_store.pool.connection.assert_not_called()
+                self.assert_session_lock_released()
+
+    def test_context_errors_without_request_id_keep_the_original_error_and_skip_request_store(self):
+        error = ChatError("CONTEXT_LIMIT_EXCEEDED", "当前问题超过上下文预算，请缩短输入。")
+        self.invoke.side_effect = error
+
+        with self.assertRaises(ChatError) as raised:
+            self.send_message()
+
+        self.assertIs(raised.exception, error)
+        self.assertEqual(self.request_store.mock_calls, [])
+        self.message_store.add_exchange.assert_not_called()
+        self.message_store.pool.connection.assert_not_called()
+        self.session_store.touch_session.assert_not_called()
+        self.assert_session_lock_released()
+
+    def test_saved_context_failure_is_replayed_without_running_or_archiving_again(self):
+        for code in ["CONTEXT_LIMIT_EXCEEDED", "CONTEXT_STATE_INVALID"]:
+            with self.subTest(code=code):
+                message = "已保存的上下文错误说明"
+                self.request_store.get_request.return_value = self.saved_request(
+                    "failed", error_code=code, error_message=message,
+                )
+
+                with self.assertRaises(ChatError) as raised:
+                    self.send_message(request_id=self.request_id)
+
+                self.assertEqual((raised.exception.code, raised.exception.message), (code, message))
+                self.invoke.assert_not_called()
+                self.request_store.try_start.assert_not_called()
+                self.request_store.mark_failed.assert_not_called()
+                self.request_store.mark_succeeded.assert_not_called()
+                self.message_store.pool.connection.assert_not_called()
                 self.assert_session_lock_released()
 
     def test_success_save_false_or_exception_is_unknown_and_does_not_return_success(self):
@@ -432,7 +574,55 @@ class ChatServiceTests(unittest.TestCase):
                 self.assertEqual(self.request_store.get_request.call_count, 1)
                 self.request_store.mark_failed.assert_not_called()
                 self.session_store.touch_session.assert_not_called()
+                self.assertIsNotNone(self.transaction.__exit__.call_args.args[0])
                 self.assert_session_lock_released()
+
+    def test_archive_failure_rolls_back_and_never_marks_the_model_request_failed(self):
+        self.message_store.add_exchange.side_effect = RuntimeError("private archive details")
+
+        with patch.object(chat_service, "logger"):
+            with self.assertRaises(ChatError) as raised:
+                self.send_message(request_id=self.request_id)
+
+        self.assertEqual(raised.exception.code, "REQUEST_STATE_UNKNOWN")
+        self.assertNotIn("private archive details", raised.exception.message)
+        self.invoke.assert_called_once()
+        self.request_store.mark_succeeded.assert_not_called()
+        self.request_store.mark_failed.assert_not_called()
+        self.session_store.touch_session.assert_not_called()
+        self.assertIs(self.transaction.__exit__.call_args.args[0], RuntimeError)
+        self.assert_session_lock_released()
+
+    def test_legacy_archive_failure_is_safe_without_creating_an_idempotent_request(self):
+        self.message_store.add_exchange.side_effect = RuntimeError("private archive details")
+
+        with patch.object(chat_service, "logger"):
+            with self.assertRaises(ChatError) as raised:
+                self.send_message()
+
+        self.assertEqual(raised.exception.code, "CHAT_HISTORY_SAVE_FAILED")
+        self.assertNotIn("private archive details", raised.exception.message)
+        self.assertEqual(self.request_store.mock_calls, [])
+        self.session_store.touch_session.assert_not_called()
+        self.assertIs(self.transaction.__exit__.call_args.args[0], RuntimeError)
+        self.assert_session_lock_released()
+
+    def test_success_transaction_commit_failure_is_unknown_and_does_not_return_a_reply(self):
+        self.transaction.__exit__.side_effect = RuntimeError("private commit details")
+
+        with patch.object(chat_service, "logger"):
+            with self.assertRaises(ChatError) as raised:
+                self.send_message(request_id=self.request_id)
+
+        self.assertEqual(raised.exception.code, "REQUEST_STATE_UNKNOWN")
+        self.assertNotIn("private commit details", raised.exception.message)
+        self.message_store.add_exchange.assert_called_once()
+        self.request_store.mark_succeeded.assert_called_once_with(
+            self.request_id, "Hello", connection=self.connection
+        )
+        self.request_store.mark_failed.assert_not_called()
+        self.session_store.touch_session.assert_not_called()
+        self.assert_session_lock_released()
 
     def test_failure_save_false_or_exception_is_unknown_without_retrying_the_model(self):
         self.invoke.side_effect = httpx.ReadTimeout("private upstream details")
@@ -460,7 +650,9 @@ class ChatServiceTests(unittest.TestCase):
         self.session_store.touch_session.side_effect = RuntimeError("private database details")
         with self.assertLogs("src.service.chat_service", level="ERROR"):
             self.assertEqual(self.send_message(request_id=self.request_id), "Hello")
-        self.request_store.mark_succeeded.assert_called_once_with(self.request_id, "Hello")
+        self.request_store.mark_succeeded.assert_called_once_with(
+            self.request_id, "Hello", connection=self.connection
+        )
         self.request_store.mark_failed.assert_not_called()
         self.assert_session_lock_released()
 

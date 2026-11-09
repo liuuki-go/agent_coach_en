@@ -4,16 +4,25 @@ import unittest
 from unittest.mock import Mock, patch
 
 from src.agents.english_teacher import agent_factory, model_factory
+from src.agents.english_teacher.context_policy import ContextBudget
 
 
 class ModelFactoryTests(unittest.TestCase):
     def setUp(self):
-        for name, value in [("_catalog", None), ("_model", None), ("get_config_value", Mock()), ("ChatOllama", Mock())]:
+        self.budget = ContextBudget(
+            context_window_tokens=8192, max_output_tokens=1024,
+            safety_margin_tokens=512, chars_per_token=1.0,
+        )
+        for name, value in [
+            ("_catalog", None), ("_model", None), ("get_config_value", Mock()),
+            ("get_context_budget", Mock(return_value=self.budget)), ("ChatOllama", Mock()),
+        ]:
             patcher = patch.object(model_factory, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
         self.get_config = model_factory.get_config_value
         self.constructor = model_factory.ChatOllama
+        self.get_budget = model_factory.get_context_budget
         self.config = {
             "default": "default-model",
             "models": [
@@ -28,6 +37,8 @@ class ModelFactoryTests(unittest.TestCase):
         self.assertEqual(kwargs["model"], "default-model")
         self.assertEqual(kwargs["base_url"], "http://default.invalid:11434")
         self.assertEqual(kwargs["temperature"], 0.7)
+        self.assertEqual(kwargs["num_ctx"], self.budget.context_window_tokens)
+        self.assertEqual(kwargs["num_predict"], self.budget.max_output_tokens)
 
     def assert_invalid_config(self, config, field):
         self.get_config.return_value = config
@@ -45,6 +56,41 @@ class ModelFactoryTests(unittest.TestCase):
         self.assertIs(model_factory.get_model(), first)
         self.constructor.assert_called_once()
         self.get_config.assert_called_once_with("model_list")
+        self.get_budget.assert_called_once_with()
+
+    def test_context_window_and_output_cap_are_forwarded_to_ollama(self):
+        self.get_budget.return_value = ContextBudget(
+            context_window_tokens=12288, max_output_tokens=2048,
+            safety_margin_tokens=768, chars_per_token=1.5,
+        )
+
+        model_factory.get_model()
+
+        kwargs = self.constructor.call_args.kwargs
+        self.assertEqual(kwargs["num_ctx"], 12288)
+        self.assertEqual(kwargs["num_predict"], 2048)
+        self.assertNotIn("safety_margin_tokens", kwargs)
+        self.assertNotIn("chars_per_token", kwargs)
+
+    def test_invalid_context_budget_prevents_model_construction(self):
+        self.get_budget.side_effect = ValueError("context_budget 配置无效")
+
+        with self.assertRaisesRegex(ValueError, "context_budget"):
+            model_factory.get_model()
+
+        self.constructor.assert_not_called()
+
+    def test_cached_model_keeps_the_original_context_configuration(self):
+        first = model_factory.get_model()
+        self.get_budget.return_value = ContextBudget(
+            context_window_tokens=4096, max_output_tokens=512,
+            safety_margin_tokens=256, chars_per_token=1.0,
+        )
+
+        self.assertIs(model_factory.get_model(), first)
+        self.get_budget.assert_called_once_with()
+        self.assertEqual(self.constructor.call_args.kwargs["num_ctx"], 8192)
+        self.assertEqual(self.constructor.call_args.kwargs["num_predict"], 1024)
 
     def test_public_list_contains_only_names_and_display_names(self):
         self.config["models"][0]["api_key"] = "test-only-secret"
@@ -57,6 +103,7 @@ class ModelFactoryTests(unittest.TestCase):
             ],
         })
         self.constructor.assert_not_called()
+        self.get_budget.assert_not_called()
 
     def test_public_list_cannot_mutate_catalog(self):
         public = model_factory.get_model_list()
@@ -198,14 +245,27 @@ class ModelFactoryTests(unittest.TestCase):
 class AgentFactoryTests(unittest.TestCase):
     def test_agent_uses_configured_model_without_custom_parameters(self):
         model, checkpointer, tool = Mock(), Mock(), Mock()
-        with patch.object(agent_factory, "get_model", return_value=model) as get_model, patch.object(agent_factory, "create_agent") as create_agent:
+        budget = ContextBudget(
+            context_window_tokens=8192, max_output_tokens=1024,
+            safety_margin_tokens=512, chars_per_token=1.0,
+        )
+        middleware = Mock()
+        with (
+            patch.object(agent_factory, "get_model", return_value=model) as get_model,
+            patch.object(agent_factory, "get_context_budget", return_value=budget) as get_budget,
+            patch.object(agent_factory, "create_context_middleware", return_value=middleware) as create_middleware,
+            patch.object(agent_factory, "create_agent") as create_agent,
+        ):
             result = agent_factory.build_agent(checkpointer, [tool])
         get_model.assert_called_once_with()
+        get_budget.assert_called_once_with()
+        create_middleware.assert_called_once_with(budget)
         create_agent.assert_called_once_with(
             model=model,
             tools=[tool],
             system_prompt=agent_factory.SYSTEM_PROMPT,
             checkpointer=checkpointer,
+            middleware=[middleware],
         )
         self.assertIs(result, create_agent.return_value)
         self.assertEqual(list(inspect.signature(agent_factory.build_agent).parameters), ["checkpointer", "tools"])

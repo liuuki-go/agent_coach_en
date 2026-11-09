@@ -5,6 +5,7 @@ from src.agents.english_teacher.agent_runner import invoke
 from src.common.agent_lock import SessionLocks
 from src.common.db.session_store import SessionStore
 from src.common.db.request_store import RequestStore
+from src.common.db.message_store import MessageStore
 from psycopg.rows import DictRow
 from src.common.third_party_types import AgentGraph
 from src.domains.error_domain import ChatError
@@ -22,6 +23,7 @@ def send_message(
     session_store: SessionStore,
     session_locks: SessionLocks,
     request_store: RequestStore,
+    message_store: MessageStore,
     request_id: UUID | None = None,
 ) -> str:
     """组织一轮聊天；共享资源由调用方传入，服务不依赖 FastAPI 应用。"""
@@ -105,6 +107,10 @@ def send_message(
             )
             _save_request_failure(request_store, request_id, error)
             raise error from None
+        except ChatError as error:
+            # 上下文超限等业务拒绝保留具体原因，失败回放也不重新调用模型。
+            _save_request_failure(request_store, request_id, error)
+            raise
         except Exception as exc:
             logger.error(
                 "chat_failed session_id=%s error_type=%s",
@@ -117,9 +123,10 @@ def send_message(
             _save_request_failure(request_store, request_id, error)
             raise error from None
 
-        # 保存结果是关键步骤，必须放在模型异常捕获范围之外。
-        if request_id is not None:
-            _save_request_success(request_store, request_id, reply)
+        # 模型在事务外执行；仅把消息归档和请求成功状态放入同一个短事务。
+        _save_chat_success(
+            message_store, request_store, session_id, request_id, content, reply,
+        )
 
         # 回复已成功生成，更新时间失败不改变本轮聊天结果。
         try:
@@ -220,29 +227,42 @@ def _reply_from_saved_request(
     )
 
 
-def _save_request_success(
+def _save_chat_success(
+    message_store: MessageStore,
     request_store: RequestStore,
-    request_id: UUID,
+    session_id: UUID,
+    request_id: UUID | None,
+    content: str,
     reply: str,
 ) -> None:
     try:
-        saved = request_store.mark_succeeded(request_id, reply)
+        with message_store.pool.connection() as connection:
+            with connection.transaction():
+                message_store.add_exchange(
+                    connection, session_id, request_id, content, reply,
+                )
+                if request_id is not None:
+                    saved = request_store.mark_succeeded(
+                        request_id, reply, connection=connection,
+                    )
+                    if not saved:
+                        # 必须在事务块内抛出，连同刚插入的消息一起回滚。
+                        raise ChatError("REQUEST_STATE_UNKNOWN", "请求状态未能确认")
     except Exception as exc:
         logger.error(
             "request_success_save_failed request_id=%s error_type=%s",
             request_id,
             type(exc).__name__,
         )
+        if request_id is None:
+            raise ChatError(
+                "CHAT_HISTORY_SAVE_FAILED",
+                "回复已生成，但聊天档案保存结果尚未确认，请勿直接重复发送。",
+            ) from None
         raise ChatError(
             "REQUEST_STATE_UNKNOWN",
-            "回复已生成，但保存结果尚未确认，请保留原请求 ID。",
+            "回复已生成，但聊天档案与请求结果保存尚未确认，请保留原请求 ID。",
         ) from None
-
-    if not saved:
-        raise ChatError(
-            "REQUEST_STATE_UNKNOWN",
-            "回复已生成，但请求状态未能确认，请保留原请求 ID。",
-        )
 
 
 def _save_request_failure(
