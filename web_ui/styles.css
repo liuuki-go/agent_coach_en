@@ -660,6 +660,48 @@ button[hidden],[hidden] {
   margin:12px 0 0
 }
 
+.request-recovery {
+  margin-bottom:12px;
+  padding:12px 14px;
+  border:1px solid #dce2d2;
+  border-radius:12px;
+  background:#f5f7ef;
+  color:#52674c;
+  font-size:12px;
+  line-height:1.6;
+}
+
+.request-recovery p {
+  margin:0 0 8px;
+}
+
+.request-result {
+  max-height:180px;
+  overflow:auto;
+  white-space:pre-wrap;
+  overflow-wrap:anywhere;
+  margin-bottom:10px;
+}
+
+.request-actions {
+  display:flex;
+  flex-wrap:wrap;
+  gap:8px;
+}
+
+.request-actions button {
+  border:1px solid #d3dbc8;
+  border-radius:7px;
+  padding:5px 10px;
+  background:#fff;
+  color:inherit;
+}
+
+.request-actions button:disabled {
+  opacity:.5;
+  cursor:default;
+}
+
 .message-list {
   max-width:810px;
   margin:0 auto;

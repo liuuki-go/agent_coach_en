@@ -5,6 +5,8 @@ const A = "11111111-1111-4111-8111-111111111111";
 const B = "22222222-2222-4222-8222-222222222222";
 const C = "33333333-3333-4333-8333-333333333333";
 const DATE = "2026-11-05T12:00:00Z";
+const REQUEST_KEY_PREFIX = "teresa.chatRequest.";
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 let importNumber = 0;
 
 class Element {
@@ -58,6 +60,7 @@ function server(initial = []) {
     sessions: initial,
     details: new Map(initial.map((item) => [item.id, item])),
     histories: new Map(initial.map((item) => [item.id, []])),
+    requests: new Map(),
     calls: [],
     onChat: null,
     onHistory: null,
@@ -65,6 +68,7 @@ function server(initial = []) {
     onList: null,
     onSession: null,
     onCreate: null,
+    onRequestStatus: null,
     modelCatalog: {
       default: "model-b",
       models: [
@@ -72,6 +76,20 @@ function server(initial = []) {
         { name: "model-b", display_name: "模型 B" },
       ],
     },
+  };
+  state.completeChat = (body, reply = "Hello!") => {
+    const previous = state.requests.get(body.request_id);
+    if (previous?.status !== "succeeded") {
+      state.histories.get(body.session_id).push(
+        { id: null, role: "user", content: body.content },
+        { id: null, role: "assistant", content: reply },
+      );
+    }
+    state.requests.set(body.request_id, {
+      request_id: body.request_id, session_id: body.session_id, content: body.content,
+      status: "succeeded", reply, error: null,
+    });
+    return Response.json(reply);
   };
   state.fetch = async (url, options) => {
     const body = options.body && JSON.parse(options.body);
@@ -99,12 +117,34 @@ function server(initial = []) {
       return found ? Response.json(found) : Response.json({ detail: "会话不存在" }, { status: 404 });
     }
     if (url === "/api/chat" && options.method === "POST") {
+      assert.match(body.request_id, UUID_PATTERN);
       if (state.onChat) return state.onChat(body, options);
-      state.histories.get(body.session_id).push(
-        { id: null, role: "user", content: body.content },
-        { id: null, role: "assistant", content: "Hello!" },
-      );
-      return Response.json("Hello!");
+      const previous = state.requests.get(body.request_id);
+      if (previous) {
+        if (previous.session_id !== body.session_id || previous.content !== body.content) {
+          return Response.json({ detail: "请求 ID 已用于其他会话或内容" }, { status: 409 });
+        }
+        if (previous.status === "succeeded") return Response.json(previous.reply);
+        return Response.json({ detail: previous.error?.message ?? "请求仍在处理中" }, {
+          status: previous.status === "processing" ? 409 : 504,
+        });
+      }
+      return state.completeChat(body);
+    }
+    const parsedUrl = new URL(url, "http://localhost");
+    const requestPath = parsedUrl.pathname.match(/^\/api\/chat\/requests\/([^/]+)$/);
+    if (requestPath && options.method === "GET") {
+      const requestId = requestPath[1];
+      const sessionId = parsedUrl.searchParams.get("session_id");
+      if (state.onRequestStatus) return state.onRequestStatus(requestId, sessionId, options);
+      const found = state.requests.get(requestId);
+      if (!found || found.session_id !== sessionId) {
+        return Response.json({ detail: "请求不存在" }, { status: 404 });
+      }
+      return Response.json({
+        request_id: found.request_id, session_id: found.session_id, status: found.status,
+        reply: found.reply, error: found.error,
+      });
     }
     if (url === "/api/sessions/getSessionMessages" && options.method === "POST") {
       if (state.onHistory) return state.onHistory(body, options);
@@ -144,7 +184,13 @@ async function openApp(t, state, storage = new Map(), { waitForModels = true, wa
   const previous = { document: globalThis.document, localStorage: globalThis.localStorage, fetch: globalThis.fetch };
   Object.assign(globalThis, {
     document,
-    localStorage: { getItem: (key) => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value) },
+    localStorage: {
+      getItem: (key) => storage.get(key) ?? null,
+      setItem: (key, value) => storage.set(key, value),
+      removeItem: (key) => storage.delete(key),
+      get length() { return storage.size; },
+      key: (index) => [...storage.keys()][index] ?? null,
+    },
     fetch: state.fetch,
   });
   t.after(() => Object.assign(globalThis, previous));
@@ -160,6 +206,27 @@ function threadButton(ui, title) {
 
 function chatCalls(state) {
   return state.calls.filter((call) => call.url === "/api/chat");
+}
+
+function statusCalls(state) {
+  return state.calls.filter((call) => call.url.startsWith("/api/chat/requests/"));
+}
+
+function assertChatBody(body, sessionId, content) {
+  assert.match(body.request_id, UUID_PATTERN);
+  assert.deepEqual(body, { session_id: sessionId, content, request_id: body.request_id });
+  return body.request_id;
+}
+
+function storedRequests(storage) {
+  return [...storage].filter(([key]) => key.startsWith(REQUEST_KEY_PREFIX))
+    .map(([, value]) => JSON.parse(value));
+}
+
+function seedRequest(storage, requestId, sessionId, content, status = "pending", extra = {}) {
+  const record = { requestId, sessionId, content, status, createdAt: new Date(DATE).toISOString(), ...extra };
+  storage.set(`${REQUEST_KEY_PREFIX}${requestId}`, JSON.stringify(record));
+  return record;
 }
 
 function descendants(element) {
@@ -222,6 +289,14 @@ function assertReady(ui) {
   assert.equal(ui.get("#message-list").attributes.get("aria-busy"), "false");
 }
 
+function assertRecoverySettled(ui) {
+  assert.equal(ui.get("#request-recovery").hidden, false);
+  assert.equal(ui.get("#new-chat").disabled, false);
+  assert.equal(ui.get("#reload-history").disabled, false);
+  assert.equal(ui.get("#stop-button").hidden, true);
+  assert.equal(ui.get("#message-list").attributes.get("aria-busy"), "false");
+}
+
 test("模型菜单展示服务端默认项和全部安全文字，其他项不可切换且聊天请求不变", async (t) => {
   const state = server([session(A, "英语练习")]);
   state.modelCatalog.models[0].display_name = "<img src=x onerror=alert(1)>";
@@ -246,7 +321,7 @@ test("模型菜单展示服务端默认项和全部安全文字，其他项不�
   assert.deepEqual([...ui.storage.entries()], [["teresa.activeSessionId", A]]);
   ui.get("#message-input").value = "正常聊天";
   await ui.get("#chat-form").emit("submit");
-  assert.deepEqual(chatCalls(state)[0].body, { session_id: A, content: "正常聊天" });
+  assertChatBody(chatCalls(state)[0].body, A, "正常聊天");
   assert.deepEqual(state.calls.filter((call) => call.url.startsWith("/api/models/")), [
     { url: "/api/models/getModelList", method: "GET", body: undefined },
   ]);
@@ -281,7 +356,7 @@ test("模型列表读取失败独立提示，不阻塞历史显示和正常聊�
   ui.get("#message-input").value = "模型列表失败时继续聊天";
   await ui.get("#chat-form").emit("submit");
   assert.match(ui.get("#message-list").textContent, /Hello!/);
-  assert.deepEqual(chatCalls(state)[0].body, { session_id: A, content: "模型列表失败时继续聊天" });
+  assertChatBody(chatCalls(state)[0].body, A, "模型列表失败时继续聊天");
   assert.equal(ui.get("#model-status").hidden, false);
 });
 
@@ -381,7 +456,7 @@ test("保存的会话ID已失效时回退到服务端有效会话并读取历史
   assert.equal(chatCalls(state).length, 0);
 });
 
-test("新建使用后端ID，聊天只发两个字段，本页切换保留真实回复", async (t) => {
+test("新建使用后端会话ID，聊天只发送本次内容和请求ID，本页切换保留真实回复", async (t) => {
   const state = server([session(A, "旧会话")]);
   const ui = await openApp(t, state);
   await ui.get("#new-chat").emit("click");
@@ -389,7 +464,7 @@ test("新建使用后端ID，聊天只发两个字段，本页切换保留真实
   assert.equal(ui.get("#message-list").children.length, 0);
   ui.get("#message-input").value = "本次新问题";
   await ui.get("#chat-form").emit("submit");
-  assert.deepEqual(chatCalls(state)[0].body, { session_id: B, content: "本次新问题" });
+  assertChatBody(chatCalls(state)[0].body, B, "本次新问题");
   assert.match(ui.get("#message-list").textContent, /本次新问题/);
   assert.match(ui.get("#message-list").textContent, /Hello!/);
   assert.equal(ui.get("#message-list").children.length, 2);
@@ -574,7 +649,7 @@ test("历史中的HTML也只作为文本显示", async (t) => {
   assert.equal(chatCalls(state).length, 0);
 });
 
-test("停止只取消等待，保留草稿并提示重复风险，不自动重新发送", async (t) => {
+test("停止只取消等待，保留原请求且不自动发送，显式重试复用同一ID", async (t) => {
   const state = server([session(A, "英语练习")]);
   let signalStarted;
   const started = new Promise((resolve) => { signalStarted = resolve; });
@@ -590,20 +665,22 @@ test("停止只取消等待，保留草稿并提示重复风险，不自动重�
   await started;
   await ui.get("#stop-button").emit("click");
   await submitting;
-  assert.equal(ui.get("#message-input").value, "稍后回复的问题");
-  assert.match(ui.get("#chat-error").textContent, /后端可能仍在处理/);
-  assert.match(ui.get("#chat-error").textContent, /重新发送可能重复执行/);
+  const requestId = assertChatBody(chatCalls(state)[0].body, A, "稍后回复的问题");
+  assert.equal(storedRequests(ui.storage)[0].requestId, requestId);
+  assert.equal(storedRequests(ui.storage)[0].content, "稍后回复的问题");
+  assertRecoverySettled(ui);
   assert.equal(ui.get("#message-list").children.length, 0);
   assert.equal(chatCalls(state).length, 1);
   assert.equal(state.calls.filter((call) => call.url === "/api/sessions/getSessionById").length, 1);
   state.onChat = null;
-  await ui.get("#chat-form").emit("submit");
+  await ui.get("#check-request").emit("click");
+  await ui.get("#retry-request").emit("click");
   assert.equal(chatCalls(state).length, 2);
-  assert.deepEqual(chatCalls(state)[1].body, { session_id: A, content: "稍后回复的问题" });
+  assert.deepEqual(chatCalls(state)[1].body, chatCalls(state)[0].body);
   assert.equal(ui.get("#message-list").children.length, 2);
 });
 
-test("超时停止等待也保留草稿，不能承诺服务端取消或幂等恢复", async (t) => {
+test("超时停止等待保留原ID和正文，不能把超时当服务端取消", async (t) => {
   const realSetTimeout = globalThis.setTimeout;
   globalThis.setTimeout = (callback, delay, ...args) => realSetTimeout(callback, delay === 120000 ? 0 : delay, ...args);
   t.after(() => { globalThis.setTimeout = realSetTimeout; });
@@ -614,30 +691,32 @@ test("超时停止等待也保留草稿，不能承诺服务端取消或幂等�
   const ui = await openApp(t, state);
   ui.get("#message-input").value = "超时的问题";
   await ui.get("#chat-form").emit("submit");
-  assert.equal(ui.get("#message-input").value, "超时的问题");
+  assert.equal(storedRequests(ui.storage)[0].content, "超时的问题");
+  assert.equal(storedRequests(ui.storage)[0].requestId, chatCalls(state)[0].body.request_id);
   assert.match(ui.get("#chat-error").textContent, /等待超过两分钟/);
-  assert.match(ui.get("#chat-error").textContent, /重新发送可能重复执行/);
   assert.equal(chatCalls(state).length, 1);
+  assertRecoverySettled(ui);
 });
 
-test("响应丢失无法读取后台结果，保留输入供用户决定，失败不会伪造消息", async (t) => {
+test("响应丢失保留原请求，查询404后显式同ID重试，不伪造消息", async (t) => {
   const state = server([session(A, "英语练习")]);
   let attempts = 0;
-  state.onChat = () => {
+  state.onChat = (body) => {
     if (++attempts === 1) throw new TypeError("response lost after processing");
-    return Response.json("真实收到的回复");
+    return state.completeChat(body, "真实收到的回复");
   };
   const ui = await openApp(t, state);
   ui.get("#message-input").value = "网络测试";
   await ui.get("#chat-form").emit("submit");
-  assert.equal(ui.get("#message-input").value, "网络测试");
-  assert.match(ui.get("#chat-error").textContent, /后端可能已执行/);
-  assert.match(ui.get("#chat-error").textContent, /重新发送可能重复执行/);
+  assert.equal(storedRequests(ui.storage)[0].content, "网络测试");
+  assert.equal(storedRequests(ui.storage)[0].requestId, chatCalls(state)[0].body.request_id);
   assert.equal(ui.get("#message-list").children.length, 0);
   assert.equal(chatCalls(state).length, 1);
-  await ui.get("#chat-form").emit("submit");
+  await ui.get("#check-request").emit("click");
+  await ui.get("#retry-request").emit("click");
   assert.equal(chatCalls(state).length, 2);
   assert.equal(ui.get("#message-list").children.length, 2);
+  assert.deepEqual(chatCalls(state)[1].body, chatCalls(state)[0].body);
   assert.match(ui.get("#message-list").textContent, /真实收到的回复/);
 });
 
@@ -764,7 +843,7 @@ test("成功回复后的历史同步超时保留回复并解除忙碌，不恢�
   assert.match(ui.get("#chat-error").textContent, /超时/);
   assert.equal(ui.get("#message-input").value, "");
   assert.equal(chatCalls(state).length, 1);
-  assertReady(ui);
+  assertRecoverySettled(ui);
   state.onHistory = null;
   await ui.get("#reload-history").emit("click");
   assert.equal(ui.get("#message-list").children.length, 2);
@@ -857,7 +936,7 @@ test("模型列表超时独立提示，等待期间和超时后均可继续聊�
   assert.equal(ui.get("#model-status").hidden, false);
 });
 
-test("聊天响应头到达后body挂起仍按聊天超时恢复草稿，不能误报无效JSON", async (t) => {
+test("聊天响应头到达后body挂起仍保留原请求，不能误报无效JSON", async (t) => {
   const clock = deadlineClock(t);
   const state = server([session(A, "英语练习")]);
   const stalled = stalledRequest();
@@ -873,12 +952,331 @@ test("聊天响应头到达后body挂起仍按聊天超时恢复草稿，不能�
   assert.equal(ui.get("#stop-button").hidden, false);
   clock.expire(120000);
   await submitting;
-  assert.equal(ui.get("#message-input").value, "body未完成的问题");
+  assert.equal(storedRequests(ui.storage)[0].content, "body未完成的问题");
+  assert.equal(storedRequests(ui.storage)[0].requestId, chatCalls(state)[0].body.request_id);
   assert.equal(ui.get("#message-list").children.length, 0);
   assert.match(ui.get("#chat-error").textContent, /等待超过两分钟/);
-  assert.match(ui.get("#chat-error").textContent, /后端可能仍在处理/);
-  assert.match(ui.get("#chat-error").textContent, /重新发送可能重复执行/);
   assert.doesNotMatch(ui.get("#chat-error").textContent, /无效.*JSON/);
   assert.equal(chatCalls(state).length, 1);
-  assertReady(ui);
+  assertRecoverySettled(ui);
+});
+
+test("每次新逻辑发送先持久化独立UUID，相同正文的新消息使用不同ID", async (t) => {
+  const state = server([session(A, "英语练习")]);
+  const storage = new Map();
+  state.onChat = (body) => {
+    const record = storedRequests(storage).find((item) => item.requestId === body.request_id);
+    assert.ok(record, "请求必须在POST前成功保存");
+    assert.equal(record.sessionId, body.session_id);
+    assert.equal(record.content, body.content);
+    return state.completeChat(body);
+  };
+  const ui = await openApp(t, state, storage);
+  for (let index = 0; index < 2; index++) {
+    ui.get("#message-input").value = "  same words  ";
+    await ui.get("#chat-form").emit("submit");
+    assertReady(ui);
+    assert.equal(storedRequests(storage).length, 0);
+  }
+  const calls = chatCalls(state);
+  assert.equal(calls.length, 2);
+  assertChatBody(calls[0].body, A, "same words");
+  assertChatBody(calls[1].body, A, "same words");
+  assert.notEqual(calls[0].body.request_id, calls[1].body.request_id);
+  assert.equal(ui.get("#message-list").children.length, 4);
+});
+
+test("存在未知请求时修改正文不能覆盖旧ID，显式重试仍发送原文", async (t) => {
+  const state = server([session(A, "英语练习")]);
+  state.onChat = () => { throw new TypeError("response lost"); };
+  const ui = await openApp(t, state);
+  ui.get("#message-input").value = "最初的问题";
+  await ui.get("#chat-form").emit("submit");
+  const original = { ...chatCalls(state)[0].body };
+  ui.get("#message-input").value = "这是另一条新消息";
+  await ui.get("#message-input").emit("input");
+  await ui.get("#chat-form").emit("submit");
+  assert.equal(chatCalls(state).length, 1);
+  assert.equal(storedRequests(ui.storage).length, 1);
+  assert.equal(storedRequests(ui.storage)[0].requestId, original.request_id);
+  assert.equal(storedRequests(ui.storage)[0].content, "最初的问题");
+  state.onChat = null;
+  await ui.get("#check-request").emit("click");
+  await ui.get("#retry-request").emit("click");
+  assert.equal(chatCalls(state).length, 2);
+  assert.deepEqual(chatCalls(state)[1].body, original);
+  assert.match(ui.get("#message-list").textContent, /最初的问题/);
+  assert.doesNotMatch(ui.get("#message-list").textContent, /这是另一条新消息/);
+});
+
+test("回复已保存但响应丢失，重新打开仅GET恢复且不重复显示历史", async (t) => {
+  const state = server([session(A, "英语练习")]);
+  const storage = new Map();
+  state.onChat = (body) => {
+    state.completeChat(body, "后台已完成的回复");
+    throw new TypeError("response lost after success");
+  };
+  const ui = await openApp(t, state, storage);
+  ui.get("#message-input").value = "后端已保存的问题";
+  await ui.get("#chat-form").emit("submit");
+  const requestId = chatCalls(state)[0].body.request_id;
+  assert.equal(storedRequests(storage)[0].requestId, requestId);
+  state.onChat = null;
+  await t.test("重新打开恢复结果", async (child) => {
+    const reopened = await openApp(child, state, storage);
+    assert.equal(chatCalls(state).length, 1);
+    assert.equal(statusCalls(state).length, 1);
+    const query = new URL(statusCalls(state)[0].url, "http://localhost");
+    assert.equal(query.pathname, `/api/chat/requests/${requestId}`);
+    assert.equal(query.searchParams.get("session_id"), A);
+    assert.equal(reopened.get("#message-list").children.length, 2);
+    assert.match(reopened.get("#message-list").textContent, /后台已完成的回复/);
+    assert.equal(storedRequests(storage).length, 0);
+    assertReady(reopened);
+  });
+});
+
+test("恢复processing仅查询不自动POST，完成后再次查询替换历史", async (t) => {
+  const state = server([session(A, "英语练习")]);
+  const storage = new Map([["teresa.activeSessionId", A]]);
+  seedRequest(storage, C, A, "仍在处理的问题");
+  const body = { request_id: C, session_id: A, content: "仍在处理的问题" };
+  state.requests.set(C, { ...body, status: "processing", reply: null, error: null });
+  const ui = await openApp(t, state, storage);
+  assert.equal(chatCalls(state).length, 0);
+  assert.equal(statusCalls(state).length, 1);
+  assert.equal(storedRequests(storage)[0].requestId, C);
+  assert.match(ui.get("#request-note").textContent, /处理|尚未完成/);
+  ui.get("#message-input").value = "不能绕过旧请求的新问题";
+  await ui.get("#chat-form").emit("submit");
+  assert.equal(chatCalls(state).length, 0);
+  state.completeChat(body, "处理完成的回复");
+  await ui.get("#check-request").emit("click");
+  assert.equal(chatCalls(state).length, 0);
+  assert.equal(ui.get("#message-list").children.length, 2);
+  assert.match(ui.get("#message-list").textContent, /处理完成的回复/);
+  assert.equal(storedRequests(storage).length, 0);
+});
+
+test("恢复failed展示原错误且不重跑，明确开始新消息才生成新ID", async (t) => {
+  const state = server([session(A, "英语练习")]);
+  const storage = new Map([["teresa.activeSessionId", A]]);
+  seedRequest(storage, C, A, "失败的旧问题");
+  state.requests.set(C, {
+    request_id: C, session_id: A, content: "失败的旧问题", status: "failed", reply: null,
+    error: { code: "MODEL_TIMEOUT", message: "模型原有超时错误" },
+  });
+  const ui = await openApp(t, state, storage);
+  assert.equal(storedRequests(storage)[0].status, "failed");
+  assert.match(ui.get("#request-note").textContent + ui.get("#request-result").textContent, /模型原有超时错误/);
+  assert.equal(chatCalls(state).length, 0);
+  await ui.get("#retry-request").emit("click");
+  assert.equal(chatCalls(state).length, 0);
+  await ui.get("#new-request").emit("click");
+  assert.equal(storedRequests(storage).length, 0);
+  ui.get("#message-input").value = "失败的旧问题";
+  await ui.get("#chat-form").emit("submit");
+  assert.equal(chatCalls(state).length, 1);
+  assert.notEqual(chatCalls(state)[0].body.request_id, C);
+});
+
+test("恢复查询404保留旧ID，显式重试不会创建另一逻辑请求", async (t) => {
+  const state = server([session(A, "英语练习")]);
+  const storage = new Map([["teresa.activeSessionId", A]]);
+  seedRequest(storage, C, A, "尚未登记的问题");
+  const ui = await openApp(t, state, storage);
+  assert.equal(chatCalls(state).length, 0);
+  assert.equal(statusCalls(state).length, 1);
+  assert.equal(storedRequests(storage)[0].requestId, C);
+  await ui.get("#retry-request").emit("click");
+  assert.equal(chatCalls(state).length, 1);
+  assert.deepEqual(chatCalls(state)[0].body, { request_id: C, session_id: A, content: "尚未登记的问题" });
+  assert.equal(state.histories.get(A).length, 2);
+});
+
+test("请求状态查询失败或超时保留原ID，恢复按钮可再次查询且不POST", async (t) => {
+  const clock = deadlineClock(t);
+  const state = server([session(A, "英语练习")]);
+  const storage = new Map([["teresa.activeSessionId", A]]);
+  seedRequest(storage, C, A, "状态未知的问题");
+  state.onRequestStatus = () => Response.json({ detail: "状态服务暂不可用" }, { status: 503 });
+  const ui = await openApp(t, state, storage);
+  assert.equal(storedRequests(storage)[0].requestId, C);
+  assert.equal(chatCalls(state).length, 0);
+  const stalled = stalledRequest();
+  state.onRequestStatus = (_requestId, _sessionId, options) => stalled.handle(options);
+  const checking = ui.get("#check-request").emit("click");
+  await stalled.started;
+  clock.expire(10000);
+  await checking;
+  assert.equal(storedRequests(storage)[0].requestId, C);
+  assert.equal(storedRequests(storage)[0].content, "状态未知的问题");
+  assert.equal(chatCalls(state).length, 0);
+  assertRecoverySettled(ui);
+  state.onRequestStatus = null;
+  await ui.get("#check-request").emit("click");
+  assert.equal(storedRequests(storage)[0].requestId, C);
+  assert.equal(chatCalls(state).length, 0);
+});
+
+test("GET确认成功但历史读取失败时保留真实回复，结果面板可安全恢复", async (t) => {
+  const state = server([session(A, "英语练习")]);
+  const storage = new Map([["teresa.activeSessionId", A]]);
+  seedRequest(storage, C, A, "历史不可用的问题");
+  state.requests.set(C, {
+    request_id: C, session_id: A, content: "历史不可用的问题", status: "succeeded",
+    reply: "<img src=x onerror=alert(1)>实际收到的回复", error: null,
+  });
+  state.onHistory = () => Response.json({ detail: "历史服务不可用" }, { status: 503 });
+  const ui = await openApp(t, state, storage);
+  assert.equal(chatCalls(state).length, 0);
+  assert.equal(storedRequests(storage)[0].status, "succeeded");
+  assert.match(ui.get("#request-result").textContent, /实际收到的回复/);
+  assert.match(ui.get("#request-result").textContent, /<img src=x onerror=alert\(1\)>/);
+  assert.equal(descendants(ui.get("#request-result")).some((node) => node.name === "img"), false);
+  await ui.get("#new-request").emit("click");
+  assert.equal(storedRequests(storage).length, 0);
+  assert.equal(chatCalls(state).length, 0);
+});
+
+test("本地已保存终态可直接展示，不重复POST或要求重新执行模型", async (t) => {
+  const state = server([session(A, "英语练习")]);
+  const storage = new Map([["teresa.activeSessionId", A]]);
+  seedRequest(storage, C, A, "本地完成的问题", "failed", {
+    error: { code: "MODEL_RESPONSE_ERROR", message: "本地已确认的错误" },
+  });
+  const ui = await openApp(t, state, storage);
+  assert.equal(chatCalls(state).length, 0);
+  assert.equal(statusCalls(state).length, 0);
+  assert.match(ui.get("#request-note").textContent + ui.get("#request-result").textContent, /本地已确认的错误/);
+  assert.equal(storedRequests(storage)[0].requestId, C);
+});
+
+test("请求保存失败时不POST，保留输入供存储恢复后重新发送", async (t) => {
+  const state = server([session(A, "英语练习")]);
+  const storage = new Map();
+  const originalSet = storage.set.bind(storage);
+  let denyRequests = true;
+  storage.set = (key, value) => {
+    if (denyRequests && key.startsWith(REQUEST_KEY_PREFIX)) throw new Error("storage full");
+    return originalSet(key, value);
+  };
+  const ui = await openApp(t, state, storage);
+  ui.get("#message-input").value = "保存失败不能丢失的输入";
+  await ui.get("#chat-form").emit("submit");
+  assert.equal(chatCalls(state).length, 0);
+  assert.equal(ui.get("#message-input").value, "保存失败不能丢失的输入");
+  assert.match(ui.get("#chat-error").textContent, /保存|存储/);
+  assert.equal(storedRequests(storage).length, 0);
+  denyRequests = false;
+  await ui.get("#chat-form").emit("submit");
+  assert.equal(chatCalls(state).length, 1);
+  assert.match(ui.get("#message-list").textContent, /Hello!/);
+});
+
+test("多会话未决请求各自恢复，切换只查询当前会话且不混用ID", async (t) => {
+  const state = server([session(A, "A会话"), session(B, "B会话")]);
+  const storage = new Map([["teresa.activeSessionId", A]]);
+  const requestB = "44444444-4444-4444-8444-444444444444";
+  seedRequest(storage, C, A, "A原始请求");
+  seedRequest(storage, requestB, B, "B原始请求");
+  state.requests.set(C, { request_id: C, session_id: A, content: "A原始请求", status: "processing", reply: null, error: null });
+  state.requests.set(requestB, { request_id: requestB, session_id: B, content: "B原始请求", status: "processing", reply: null, error: null });
+  const ui = await openApp(t, state, storage);
+  assert.equal(statusCalls(state).length, 1);
+  assert.match(statusCalls(state)[0].url, new RegExp(C));
+  await threadButton(ui, "B会话").emit("click");
+  assert.equal(ui.storage.get("teresa.activeSessionId"), B);
+  assert.equal(statusCalls(state).length, 2);
+  const query = new URL(statusCalls(state)[1].url, "http://localhost");
+  assert.equal(query.pathname, `/api/chat/requests/${requestB}`);
+  assert.equal(query.searchParams.get("session_id"), B);
+  assert.equal(storedRequests(storage).length, 2);
+  assert.equal(chatCalls(state).length, 0);
+});
+
+test("已收到回复但终态存储失败，刷新与状态查询失败不能丢失已知结果", async (t) => {
+  const state = server([session(A, "英语练习")]);
+  const storage = new Map();
+  const originalSet = storage.set.bind(storage);
+  let denyCompleted = true;
+  storage.set = (key, value) => {
+    if (denyCompleted && key.startsWith(REQUEST_KEY_PREFIX)
+      && JSON.parse(value).status === "succeeded") throw new Error("storage temporarily full");
+    return originalSet(key, value);
+  };
+  const ui = await openApp(t, state, storage);
+  state.onHistory = () => Response.json({ detail: "历史暂不可用" }, { status: 503 });
+  ui.get("#message-input").value = "回复不能丢失的问题";
+  await ui.get("#chat-form").emit("submit");
+  const requestId = chatCalls(state)[0].body.request_id;
+  assert.match(ui.get("#message-list").textContent, /Hello!/);
+  assert.equal(storedRequests(storage)[0].requestId, requestId);
+  assert.equal(storedRequests(storage)[0].status, "pending");
+
+  denyCompleted = false;
+  state.onHistory = () => Response.json([]);
+  state.onRequestStatus = () => Response.json({ detail: "请求状态暂不可用" }, { status: 503 });
+  await ui.get("#reload-history").emit("click");
+  const visibleResult = () => [
+    ui.get("#message-list").hidden ? "" : ui.get("#message-list").textContent,
+    ui.get("#request-result").hidden ? "" : ui.get("#request-result").textContent,
+  ].join("");
+  assert.match(visibleResult(), /Hello!/);
+  assert.equal(ui.get("#retry-request").hidden, true);
+  assert.equal(ui.get("#new-request").hidden, false);
+  await ui.get("#check-request").emit("click");
+  assert.ok(statusCalls(state).length >= 1);
+  assert.match(visibleResult(), /Hello!/);
+  assert.match(ui.get("#request-note").textContent, /已完成/);
+  assert.doesNotMatch(ui.get("#request-note").textContent, /结果暂时无法确认/);
+  assert.equal(ui.get("#retry-request").hidden, true);
+  assert.equal(ui.get("#new-request").hidden, false);
+  assert.equal(chatCalls(state).length, 1);
+});
+
+test("GET确认旧请求成功且历史后面已有其他轮时，不额外重复展示旧回复", async (t) => {
+  const state = server([session(A, "英语练习")]);
+  const storage = new Map([["teresa.activeSessionId", A]]);
+  seedRequest(storage, C, A, "旧请求的问题");
+  state.requests.set(C, {
+    request_id: C, session_id: A, content: "旧请求的问题", status: "succeeded",
+    reply: "原请求唯一回复", error: null,
+  });
+  state.histories.set(A, [
+    { id: "old-user", role: "user", content: "旧请求的问题" },
+    { id: "old-assistant", role: "assistant", content: "原请求唯一回复" },
+    { id: "new-user", role: "user", content: "后面另一轮的问题" },
+    { id: "new-assistant", role: "assistant", content: "后面另一轮的回复" },
+  ]);
+  const ui = await openApp(t, state, storage);
+  assert.equal(statusCalls(state).length, 1);
+  assert.equal(chatCalls(state).length, 0);
+  assert.equal(ui.get("#message-list").children.length, 4);
+  assert.match(ui.get("#message-list").textContent, /原请求唯一回复/);
+  assert.match(ui.get("#message-list").textContent, /后面另一轮的回复/);
+  assert.equal(ui.get("#request-result").hidden, true);
+  assert.equal(ui.get("#request-result").textContent, "");
+  assert.equal(ui.get("#message-list").textContent.match(/原请求唯一回复/g).length, 1);
+});
+
+test("本地已知失败的强制查询返回503时保留原错误且不退回未知状态", async (t) => {
+  const state = server([session(A, "英语练习")]);
+  const storage = new Map([["teresa.activeSessionId", A]]);
+  seedRequest(storage, C, A, "已确认失败的问题", "failed", {
+    error: { code: "MODEL_TIMEOUT", message: "原来已确认的模型超时" },
+  });
+  state.onRequestStatus = () => Response.json({ detail: "状态服务暂不可用" }, { status: 503 });
+  const ui = await openApp(t, state, storage);
+  assert.equal(statusCalls(state).length, 0);
+  await ui.get("#check-request").emit("click");
+  assert.equal(statusCalls(state).length, 1);
+  assert.match(ui.get("#request-note").textContent, /已确认失败/);
+  assert.match(ui.get("#request-note").textContent, /原来已确认的模型超时/);
+  assert.doesNotMatch(ui.get("#request-note").textContent, /结果暂时无法确认/);
+  assert.equal(ui.get("#retry-request").hidden, true);
+  assert.equal(ui.get("#new-request").hidden, false);
+  assert.equal(ui.get("#new-request").disabled, false);
+  assert.equal(storedRequests(storage)[0].status, "failed");
+  assert.equal(chatCalls(state).length, 0);
 });

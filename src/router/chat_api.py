@@ -6,7 +6,8 @@ from langgraph.checkpoint.postgres import PostgresSaver
 from src.common.dababase_pool import create_db_pool
 from src.agents.english_teacher.agent_factory import build_agent
 from src.agents.english_teacher.model_factory import get_model_list
-from src.common.session_store import SessionStore
+from src.common.db.session_store import SessionStore
+from src.common.db.request_store import RequestStore
 from uuid import UUID
 from src.common.third_party_types import AgentGraph
 from typing import Literal
@@ -18,7 +19,7 @@ from src.domains.session_domain import SessionMessageResponse
 from src.agent_tools.common_tool import common_tools
 from src.common.agent_lock import SessionLocks
 import logging
-from src.service.chat_service import send_message
+from src.service.chat_service import get_request_status, send_message
 from src.domains.error_domain import ChatError
 from src.domains.session_domain import GetSessionByIdRequest
 
@@ -33,6 +34,10 @@ _CHAT_ERROR_STATUS = {
     "MODEL_UNAVAILABLE": 503,
     "MODEL_RESPONSE_ERROR": 502,
     "CHAT_FAILED": 500,
+    "REQUEST_ID_CONFLICT": 409,
+    "REQUEST_PROCESSING": 409,
+    "REQUEST_STATE_UNKNOWN": 503,
+    "REQUEST_NOT_FOUND": 404,
 }
 
 @asynccontextmanager
@@ -48,6 +53,10 @@ async def lifespan(app: FastAPI):
 
         session_store = SessionStore(pool)
         session_store.setup()
+        request_store = RequestStore(pool)
+        request_store.setup()
+
+
         print("数据库连接池和 checkpointer 已就绪")
         # 创建默认的agent 实例 
         agent = build_agent(
@@ -63,6 +72,7 @@ async def lifespan(app: FastAPI):
         app.state.agent = agent
         app.state.model_list = model_list
         app.state.session_store = session_store
+        app.state.request_store = request_store
         app.state.session_locks = SessionLocks()
         yield
 
@@ -79,7 +89,11 @@ app = FastAPI(
 )
 
 
-from src.domains.chat_domain import UserMessage
+from src.domains.chat_domain import (
+    ChatRequestErrorResponse,
+    ChatRequestStatusResponse,
+    UserMessage,
+)
 # 心跳查询
 @app.get("/health")
 def health():
@@ -103,13 +117,41 @@ def chat(request: UserMessage) -> str:
             agent=app.state.agent,
             session_store=app.state.session_store,
             session_locks=app.state.session_locks,
+            request_id=request.request_id,
+            request_store=app.state.request_store,
         )
     except ChatError as exc:
         raise HTTPException(
             status_code=_CHAT_ERROR_STATUS.get(exc.code, 500),
             detail=exc.message,
         ) from None
-   
+
+
+@app.get("/api/chat/requests/{request_id}")
+def get_chat_request(request_id: UUID, session_id: UUID) -> ChatRequestStatusResponse:
+    try:
+        record = get_request_status(
+            session_id=session_id,
+            request_id=request_id,
+            session_store=app.state.session_store,
+            request_store=app.state.request_store,
+        )
+    except ChatError as exc:
+        raise HTTPException(
+            status_code=_CHAT_ERROR_STATUS.get(exc.code, 500),
+            detail=exc.message,
+        ) from None
+
+    # 数据库内部记录不直接作为公共响应，按状态只公开结果或安全错误。
+    return ChatRequestStatusResponse(
+        request_id=record["request_id"],
+        session_id=record["session_id"],
+        status=record["status"],
+        reply=record["reply"] if record["status"] == "succeeded" else None,
+        error=ChatRequestErrorResponse(
+            code=record["error_code"], message=record["error_message"],
+        ) if record["status"] == "failed" else None,
+    )
 
 @app.get("/api/sessions/getAllSessions")
 def get_all_sessions():

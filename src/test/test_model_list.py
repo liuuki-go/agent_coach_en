@@ -44,12 +44,15 @@ class ModelListTests(unittest.TestCase):
         pool = Mock()
         saver = Mock()
         store = Mock()
+        request_store = Mock()
         agent = Mock()
 
         async def start_and_stop():
             async with chat_api.lifespan(application):
                 self.assertEqual(application.state.model_list, self.catalog)
                 self.assertIs(application.state.agent, agent)
+                self.assertIs(application.state.session_store, store)
+                self.assertIs(application.state.request_store, request_store)
 
         with (
             patch("builtins.print"),
@@ -57,11 +60,15 @@ class ModelListTests(unittest.TestCase):
             patch.object(chat_api, "create_db_pool", return_value=pool),
             patch.object(chat_api, "PostgresSaver", return_value=saver),
             patch.object(chat_api, "SessionStore", return_value=store),
+            patch.object(chat_api, "RequestStore", return_value=request_store) as create_request_store,
             patch.object(chat_api, "build_agent", return_value=agent) as build_agent,
         ):
             asyncio.run(start_and_stop())
 
         build_agent.assert_called_once_with(checkpointer=saver, tools=chat_api.common_tools)
+        create_request_store.assert_called_once_with(pool)
+        store.setup.assert_called_once_with()
+        request_store.setup.assert_called_once_with()
         pool.open.assert_called_once_with(wait=True, timeout=5)
         pool.close.assert_called_once()
 
@@ -74,11 +81,13 @@ class ModelListTests(unittest.TestCase):
             patch.object(chat_api, "get_model_list", side_effect=ValueError("Invalid model_list")),
             patch.object(chat_api, "create_db_pool") as create_pool,
             patch.object(chat_api, "build_agent") as build_agent,
+            patch.object(chat_api, "RequestStore") as create_request_store,
         ):
             with self.assertRaisesRegex(ValueError, "model_list"):
                 asyncio.run(start())
         create_pool.assert_not_called()
         build_agent.assert_not_called()
+        create_request_store.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -7,8 +7,8 @@
   <meta name="description" content="和特蕾莎聊生活，在轻松的对话中练习英语。">
   <title>Teresa · 你的日常英语伙伴</title>
   <link rel="icon" href="./assets/flower.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="./styles.css?v=model-list-1">
-  <script type="module" src="./app.js?v=request-timeout-1"></script>
+  <link rel="stylesheet" href="./styles.css?v=request-id-1">
+  <script type="module" src="./app.js?v=request-id-1"></script>
 </head>
 <body>
   <svg class="icon-library" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
@@ -65,6 +65,15 @@
 
     <section class="composer-area" aria-label="输入消息">
       <div class="inline-error" id="chat-error" role="alert" hidden></div>
+      <section id="request-recovery" class="request-recovery" aria-label="上次发送结果" hidden>
+        <p id="request-note" role="status"></p>
+        <div id="request-result" class="request-result" hidden></div>
+        <div class="request-actions">
+          <button type="button" id="check-request">查询结果</button>
+          <button type="button" id="retry-request">重试原消息</button>
+          <button type="button" id="new-request" hidden>开始新消息</button>
+        </div>
+      </section>
       <form id="chat-form" class="composer">
         <label class="sr-only" for="message-input">发给特蕾莎的消息</label>
         <textarea id="message-input" rows="2" maxlength="12000" placeholder="想聊什么？从一句不完美的英语开始也很好。"></textarea>

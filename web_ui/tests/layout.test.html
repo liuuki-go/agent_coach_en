@@ -24,8 +24,13 @@ const fixtureScript = `<script>
     id: "11111111-1111-4111-8111-111111111111", title: "布局测试",
     created_at: "2026-11-05T12:00:00Z", updated_at: "2026-11-05T12:00:00Z"
   };
+  const storage = new Map();
   Object.defineProperty(window, "localStorage", { value: {
-    getItem() { return null; }, setItem() {}
+    get length() { return storage.size; },
+    key(index) { return Array.from(storage.keys())[index] ?? null; },
+    getItem(key) { return storage.get(key) ?? null; },
+    setItem(key, value) { storage.set(key, String(value)); },
+    removeItem(key) { storage.delete(key); }
   } });
   window.fetch = async (url) => {
     if (url === "/api/models/getModelList") return Response.json({

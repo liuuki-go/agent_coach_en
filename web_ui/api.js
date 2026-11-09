@@ -1,4 +1,5 @@
 export const CHAT_ENDPOINT = "/api/chat";
+export const CHAT_REQUEST_STATUS_ENDPOINT = "/api/chat/requests";
 export const SESSION_LIST_ENDPOINT = "/api/sessions/getAllSessions";
 export const SESSION_DETAIL_ENDPOINT = "/api/sessions/getSessionById";
 export const SESSION_CREATE_ENDPOINT = "/api/sessions/createSession";
@@ -19,6 +20,13 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
 function requireId(value) {
   if (typeof value !== "string" || !UUID_PATTERN.test(value)) {
     throw new ChatApiError("会话标识无效，请重新加载会话。");
+  }
+  return value;
+}
+
+function requireRequestId(value) {
+  if (typeof value !== "string" || !UUID_PATTERN.test(value)) {
+    throw new ChatApiError("请求标识无效，请确认请求 ID。");
   }
   return value;
 }
@@ -178,16 +186,53 @@ export async function getSessionMessages(sessionId, options = {}) {
   });
 }
 
-export function buildChatRequest(sessionId, content) {
+export async function getChatRequestStatus(sessionId, requestId, options = {}) {
+  const validSessionId = requireId(sessionId);
+  const validRequestId = requireRequestId(requestId);
+  const url = `${CHAT_REQUEST_STATUS_ENDPOINT}/${encodeURIComponent(validRequestId)}?session_id=${encodeURIComponent(validSessionId)}`;
+  const data = await requestJson(url, { ...options, method: "GET", body: undefined });
+  const returnedRequestId = requireRequestId(data?.request_id);
+  const returnedSessionId = requireId(data?.session_id);
+  if (returnedRequestId.toLowerCase() !== validRequestId.toLowerCase()
+    || returnedSessionId.toLowerCase() !== validSessionId.toLowerCase()) {
+    throw new ChatApiError("接口返回的请求信息不匹配。");
+  }
+
+  const { status, reply, error } = data;
+  let valid;
+  if (status === "succeeded") {
+    valid = typeof reply === "string" && Boolean(reply.trim()) && error === null;
+  } else if (status === "failed") {
+    valid = reply === null && error !== null && typeof error === "object" && !Array.isArray(error)
+      && typeof error.code === "string" && Boolean(error.code.trim())
+      && typeof error.message === "string" && Boolean(error.message.trim());
+  } else if (status === "processing") {
+    valid = reply === null && error === null;
+  }
+  if (!valid) throw new ChatApiError("接口返回的请求状态格式无效。");
+  return {
+    requestId: returnedRequestId,
+    sessionId: returnedSessionId,
+    status,
+    reply,
+    error: error === null ? null : { code: error.code, message: error.message },
+  };
+}
+
+export function buildChatRequest(sessionId, content, requestId) {
   if (typeof content !== "string" || !content.trim()) {
     throw new ChatApiError("消息内容不能为空。");
   }
   if (content.trim().length > 12000) throw new ChatApiError("消息内容不能超过 12000 个字符。");
-  return { session_id: requireId(sessionId), content: content.trim() };
+  return {
+    session_id: requireId(sessionId),
+    content: content.trim(),
+    ...(requestId === undefined ? {} : { request_id: requireRequestId(requestId) }),
+  };
 }
 
 export async function sendChat(sessionId, content, options = {}) {
-  const body = buildChatRequest(sessionId, content);
+  const body = buildChatRequest(sessionId, content, options.requestId);
   const { timeoutMs = 120_000 } = options;
   const data = await requestJson(CHAT_ENDPOINT, { ...options, timeoutMs, method: "POST", body });
   const reply = typeof data === "string" ? data : data?.reply;
